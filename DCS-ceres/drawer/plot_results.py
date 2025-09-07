@@ -18,6 +18,8 @@ parser.add_option("--initial_poses", dest="initial_poses",
                   default="init_nodes.txt", help="The filename that contains the original poses.")
 parser.add_option("--optimized_poses", dest="optimized_poses",
                   default="after_opt_nodes.txt", help="The filename that contains the optimized poses.")
+parser.add_option("--output", dest="output",
+                  default="", help="Optional output image path (PNG). If set, saves instead of showing.")
 (options, args) = parser.parse_args()
 
 # Read the original and optimized poses files.
@@ -41,5 +43,9 @@ if poses_optimized is not None:
 
 plot.axis('equal')
 plot.legend()
-# Show the plot and wait for the user to close.
-plot.show()
+# Show or save
+if options.output != '':
+  plot.savefig(options.output, dpi=150, bbox_inches='tight')
+else:
+  # Show the plot and wait for the user to close.
+  plot.show()

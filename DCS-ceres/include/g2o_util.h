@@ -155,12 +155,17 @@ public:
         cout << "Adding Bogus edges as described in Vertigo paper" << endl;
         for( int i = 0 ; i<count ; i++ )
         {
-
             int a = rand() % MAX;
             int b = rand() % MAX;
+            if (a == b) {
+                // avoid self-loops which break Ceres residual parameter blocks
+                b = (b + 1) % MAX;
+            }
             cout << "  " << a << "<--->" << b << endl;
             Edge * edge = new Edge( nNodes[a], nNodes[b], BOGUS_EDGE );
             edge->setEdgePose( rand()/RAND_MAX, rand()/RAND_MAX, rand()/RAND_MAX );
+            // Bogus 엣지에도 정보 매트릭스 설정 (실제 데이터셋과 유사한 수준)
+            edge->setInformationMatrix(2.0, 0.0, 0.0, 300.0, 0.0, 300.0);
             nEdgesBogus.push_back( edge );
         }
     }

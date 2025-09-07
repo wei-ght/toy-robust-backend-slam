@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 2.8.3)
 
 project(toy_pose_graph_robust_backend)
 
-set (CMAKE_CXX_STANDARD 11)
+set (CMAKE_CXX_STANDARD 17)
 set( CMAKE_CXX_FLAGS "-fpermissive" )
 
 find_package(Eigen3 REQUIRED)
@@ -11,9 +11,11 @@ find_package(Ceres REQUIRED)
 
 set( SRC
   main.cpp
-  include/ceres_error.h     src/ceres_error.cpp
-  include/g2o_util.h        src/g2o_util.cpp
-  include/graph.h           src/graph.cpp
+  include/ceres_error.h           src/ceres_error.cpp
+  include/g2o_util.h              src/g2o_util.cpp
+  include/graph.h                 src/graph.cpp
+  include/layer_manager.h         src/layer_manager.cpp
+  include/simple_layer_manager.h  src/simple_layer_manager.cpp
 )
 
 include_directories("${PROJECT_SOURCE_DIR}/include")
