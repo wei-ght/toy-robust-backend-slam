@@ -1,0 +1,67 @@
+{
+  "name": "ROS2",
+  "privileged": true,
+  "remoteUser": "navifra",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "USERNAME": "navifra"
+    }
+  },
+  "initializeCommand": "${localWorkspaceFolder}/scripts/devcontainer/precreate.sh",
+  "workspaceFolder": "/home/navifra/colcon_ws",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/navifra/colcon_ws,type=bind",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        // "ms-vscode.cpptools",
+        "twxs.cmake",
+        "ms-vscode.cmake-tools",
+        "ms-iot.vscode-ros",
+        "smilerobotics.urdf",
+        "xaver.clang-format",
+        "mhutchie.git-graph"
+      ]
+    }
+  },
+  "containerEnv": {
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "ROS_DOMAIN_ID": "${localEnv:ROS_DOMAIN_ID}",
+    "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY}",
+    "XDG_RUNTIME_DIR": "${localEnv:XDG_RUNTIME_DIR}",
+    "PULSE_SERVER": "${localEnv:PULSE_SERVER}",
+    "LIBGL_ALWAYS_SOFTWARE": "1" // Needed for software rendering of opengl
+  },
+  "runArgs": [
+    "--name=ros2_${localEnv:USER}_dev_paper_test",
+    "--init",
+    "--privileged",
+    "--cap-add=SYS_PTRACE",
+    "--hostname=navifra",
+    "--add-host=host.docker.internal:host-gateway",
+    "--network=host",
+    // "--gpus", // for remote
+    // "all" // for remote
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true,
+      "dockerDashComposeVersion": "v1"
+    }
+  },
+  "postCreateCommand": "sudo postcreated.sh",
+  "mounts": [
+    "source=/home/${localEnv:USER}/.key,target=/home/navifra/.key,type=bind",
+    "source=/home/${localEnv:USER}/.ros,target=/home/navifra/.ros,type=bind",
+    "source=/home/${localEnv:USER}/navifra_solution,target=/home/navifra/navifra_solution,type=bind",
+    "source=/home/${localEnv:USER}/.gitconfig,target=/home/navifra/.gitconfig,type=bind",
+    "source=/home/${localEnv:USER}/.git-credentials,target=/home/navifra/.git-credentials,type=bind",
+    "source=/home/${localEnv:USER}/.zsh_history2,target=/home/navifra/.zsh_history,type=bind",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind,consistency=cached",
+    // "source=/home/${localEnv:USER}/slam_team,target=/home/navifra/slam_team,type=bind"
+  ]
+}
