@@ -14,7 +14,6 @@ set( SRC
   include/ceres_error.h           src/ceres_error.cpp
   include/g2o_util.h              src/g2o_util.cpp
   include/graph.h                 src/graph.cpp
-  include/layer_manager.h         src/layer_manager.cpp
   include/simple_layer_manager.h  src/simple_layer_manager.cpp
 )
 

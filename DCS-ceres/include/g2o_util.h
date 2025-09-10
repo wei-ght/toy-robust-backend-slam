@@ -26,6 +26,11 @@ public:
         fstream fp;
         fp.open(fName.c_str(), ios::in);
 
+        auto normalize_angle = [](double angle_radians) {
+          double two_pi(2.0 * M_PI);
+          return angle_radians -
+            two_pi * std::floor((angle_radians + double(M_PI)) / two_pi);
+        };
 
         string line;
         int v = 0;
@@ -56,6 +61,8 @@ public:
                 double dx = boost::lexical_cast<double>( words[3] );
                 double dy = boost::lexical_cast<double>( words[4] );
                 double dtheta = boost::lexical_cast<double>( words[5] );
+                double dtheta_orig = normalize_angle(dtheta);
+              
 
                 double I11, I12, I13, I22, I23, I33;
                 I11 = boost::lexical_cast<double>( words[6] );
@@ -67,15 +74,47 @@ public:
 
                 if( abs(a_indx - b_indx) < 5 )
                 {
-                  Edge * edge = new Edge( nNodes[a_indx], nNodes[b_indx], ODOMETRY_EDGE );
-                  edge->setEdgePose(dx, dy, dtheta);
+                  double final_dx = dx, final_dy = dy, final_dtheta = dtheta_orig;
+                  int final_a_indx = a_indx, final_b_indx = b_indx;
+                  
+                  // SE2 inverse: T_BA = T_AB^(-1)
+                  double cos_theta = cos(dtheta_orig);
+                  double sin_theta = sin(dtheta_orig);
+                  final_dx = -dx * cos_theta - dy * sin_theta;
+                  final_dy = dx * sin_theta - dy * cos_theta;
+                  final_dtheta = -dtheta_orig;
+                  
+                  // Swap node indices
+                  final_a_indx = b_indx;
+                  final_b_indx = a_indx;
+                  
+                  Edge * edge = new Edge( nNodes[final_a_indx], nNodes[final_b_indx], ODOMETRY_EDGE );
+                  edge->setEdgePose(final_dx, final_dy, final_dtheta);
                   edge->setInformationMatrix(I11, I12, I13, I22, I23, I33);
+                  // Edge * edge = new Edge( nNodes[a_indx], nNodes[b_indx], ODOMETRY_EDGE );
+                  // edge->setEdgePose(dx, dy, dtheta_orig);
+                  // edge->setInformationMatrix(I11, I12, I13, I22, I23, I33);
                   nEdgesOdometry.push_back(edge);
                 }
                 else
                 {
-                  Edge * edge = new Edge( nNodes[a_indx], nNodes[b_indx], CLOSURE_EDGE );
-                  edge->setEdgePose(dx, dy, dtheta);
+                  // For CLOSURE_EDGE: apply SE2 inverse transformation if a_indx > b_indx
+                  double final_dx = dx, final_dy = dy, final_dtheta = dtheta_orig;
+                  int final_a_indx = a_indx, final_b_indx = b_indx;
+                  
+                  // SE2 inverse: T_BA = T_AB^(-1)
+                  double cos_theta = cos(dtheta_orig);
+                  double sin_theta = sin(dtheta_orig);
+                  final_dx = -dx * cos_theta - dy * sin_theta;
+                  final_dy = dx * sin_theta - dy * cos_theta;
+                  final_dtheta = -dtheta_orig;
+                  
+                  // Swap node indices
+                  final_a_indx = b_indx;
+                  final_b_indx = a_indx;
+                  
+                  Edge * edge = new Edge( nNodes[final_a_indx], nNodes[final_b_indx], CLOSURE_EDGE );
+                  edge->setEdgePose(final_dx, final_dy, final_dtheta);
                   edge->setInformationMatrix(I11, I12, I13, I22, I23, I33);
                   nEdgesClosure.push_back(edge);
                 }

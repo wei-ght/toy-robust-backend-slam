@@ -7,6 +7,10 @@
 #include <cmath>
 #include <chrono>
 #include <sstream>
+#include <iomanip>
+#include <filesystem>
+#include <limits>
+#include <memory>
 
 using std::vector;
 using std::pair;
@@ -22,6 +26,13 @@ SimpleLayerManagerV2::SimpleLayerManagerV2(ReadG2O& g, const std::string& save_p
         log_line("[init] expansion_prob=" + std::to_string(config_.expansion_prob) +
                  ", max_layers=" + std::to_string(config_.max_layers));
     }
+    // 설정값 로그 (헤더/호출자가 전달한 config 사용)
+    log_line("[init] snapshot_every=" + std::to_string(config_.snapshot_every));
+    log_line("[init] residual_mode=" + std::to_string(config_.residual_mode));
+    log_line("[init] impact_iters=" + std::to_string(config_.impact_iters) +
+             ", impact_window=" + std::to_string(config_.impact_window) +
+             ", impact_theta_w=" + std::to_string(config_.impact_theta_weight) +
+             ", impact_pose_w=" + std::to_string(config_.impact_pose_weight));
     
     // Candidate edges 수집: closure edges + bogus edges
     candidate_edges_.reserve(g2o_.nEdgesClosure.size() + g2o_.nEdgesBogus.size());
@@ -45,6 +56,8 @@ SimpleLayerManagerV2::SimpleLayerManagerV2(ReadG2O& g, const std::string& save_p
     }
     
     layers_[root_layer_id_] = std::move(root_layer);
+    base_layer_id_ = root_layer_id_;
+    online_active_k_ = -1;
     
     log_line("[init] root layer " + root_layer_id_ + " created with " + 
              std::to_string(g2o_.nNodes.size()) + " nodes");
@@ -55,9 +68,8 @@ SimpleLayerManagerV2::~SimpleLayerManagerV2()
 {
     // 메모리 정리
     for (auto& pair : layers_) {
-        for (auto* pose : pair.second->poses) {
-            delete[] pose;
-        }
+        for (auto* pose : pair.second->poses) delete[] pose;
+        for (auto& kv : pair.second->switch_vars) delete kv.second;
     }
     
     if (logfile_.is_open()) {
@@ -82,20 +94,26 @@ void SimpleLayerManagerV2::run()
         // MCTS로 최적 레이어 선택
         std::string selected_layer = select_layer_by_uct();
         
-        // Residual 기반 엣지 필터링
+        // Residual 기반 엣지 필터링 (+ 고잔차 1회 재최적화 후 재평가)
         double residual = calculate_edge_residual(selected_layer, edge);
-        log_line("[residual] edge residual=" + std::to_string(residual) + 
-                 ", low=" + std::to_string(config_.residual_low) + 
+        log_line("[residual] edge residual=" + std::to_string(residual) +
+                 ", low=" + std::to_string(config_.residual_low) +
                  ", high=" + std::to_string(config_.residual_high));
-        
-        // R_high 이상이면 스킵
-        if (residual >= config_.residual_high) {
-            log_line("[skip] edge residual too high, skipping");
-            continue;
-        }
+
+        // if (residual >= config_.residual_high) {
+        //     // 빠른 국소 최적화 후 한 번 더 평가
+        //     log_line("[gate] high residual; running quick local reopt then re-evaluate");
+        //     optimize_local_window(selected_layer, 20);
+        //     residual = calculate_edge_residual(selected_layer, edge);
+        //     log_line("[residual-recheck] edge residual=" + std::to_string(residual));
+        //     if (residual >= config_.residual_high) {
+        //         log_line("[skip] edge residual still high after reopt; skipping");
+        //         continue;
+        //     }
+        // }
         
         // R_low 이하이거나 확률적 선택으로 엣지 추가 결정
-        bool should_add = should_add_edge(selected_layer, edge);
+        bool should_add = should_add_edge(selected_layer, edge, residual);
         if (!should_add) {
             log_line("[skip] edge not selected by probabilistic filtering");
             continue;
@@ -104,29 +122,272 @@ void SimpleLayerManagerV2::run()
         // 엣지 추가 후 레이어 분할 여부 결정
         if (layers_.size() < config_.max_layers && should_split_layer(selected_layer, edge)) {
             expand_layer(selected_layer, edge);
+            // 분기 후 Top-K 전파 및 best만 최적화
+            if (config_.topk_layers > 0) {
+                auto topk = get_topk_layers_by_reward(config_.topk_layers);
+                std::string best_id = topk.empty() ? selected_layer : topk[0];
+                propagate_edge_to_layers(edge, topk, best_id, "");
+                optimize_layer(best_id);
+            }
         } else {
             // 기존 레이어에 엣지 추가
             auto* layer = get_layer(selected_layer);
-            if (layer) {
-                layer->added_edges.push_back(edge);
-                assignments_.emplace_back(edge, selected_layer);
-                
-                // 레이어 최적화: 국소 최적화 사용
-                // optimize_local_window(selected_layer, 40);
-                optimize_layer(selected_layer);
-                
+        if (layer) {
+            layer->added_edges.push_back(edge);
+            assignments_.emplace_back(edge, selected_layer);
+            if (layer->switch_vars.find(edge) == layer->switch_vars.end()) {
+                layer->switch_vars[edge] = new double(1.0);
+            }
+
+                // 최상위 K 레이어에 엣지 전파(최적화는 best만)
+                if (config_.topk_layers > 0) {
+                    auto topk = get_topk_layers_by_reward(config_.topk_layers);
+                    std::string best_id = topk.empty() ? selected_layer : topk[0];
+                    propagate_edge_to_layers(edge, topk, best_id, selected_layer);
+                    // best 레이어에만 최적화 수행
+                    optimize_layer(best_id);
+                } else {
+                    // K=0이면 현재 선택 레이어만 최적화
+                    optimize_layer(selected_layer);
+                }
+
                 // 보상 계산 및 backpropagation
                 double reward = calculate_reward(selected_layer, edge);
                 backpropagate(selected_layer, reward);
-                
-                log_line("[assign] edge to existing layer " + selected_layer + 
+
+                log_line("[assign] edge to existing layer " + selected_layer +
                          ", reward=" + std::to_string(reward));
             }
+        }
+        // 스냅샷 저장 (요청 시)
+        if (config_.snapshot_every > 0 && (step_counter_ % config_.snapshot_every == 0)) {
+            save_snapshot(step_counter_);
         }
     }
     
     save_results();
+    if (config_.snapshot_every > 0) {
+        save_snapshot(step_counter_);
+    }
     log_line("[run] METHOD 4 completed");
+}
+
+void SimpleLayerManagerV2::run_online()
+{
+    log_line("[run-online] Starting METHOD 4 ONLINE with sequential nodes");
+
+    assignments_.clear();
+    step_counter_ = 0;
+
+    // 누적 처리 카운터 (검증용)
+    int total_processed_edges = 0;
+    int total_processed_closure = 0;
+    int total_processed_bogus = 0;
+
+    int N = static_cast<int>(g2o_.nNodes.size());
+    for (int k = 1; k < N; ++k) {
+        online_active_k_ = k;
+        // 수집: 새 노드 k와 관련된 루프/보거스 에지들만 처리
+        std::vector<Edge*> new_edges;
+        new_edges.reserve(32);
+        int k_closure = 0, k_bogus = 0;
+        for (auto* e : g2o_.nEdgesClosure) {
+            int ia = e->a->index, ib = e->b->index;
+            if (std::max(ia, ib) == k) { new_edges.push_back(e); k_closure++; }
+        }
+        for (auto* e : g2o_.nEdgesBogus) {
+            int ia = e->a->index, ib = e->b->index;
+            if (std::max(ia, ib) == k) { new_edges.push_back(e); k_bogus++; }
+        }
+
+        // 누적 갱신
+        total_processed_edges += (int)new_edges.size();
+        total_processed_closure += k_closure;
+        total_processed_bogus += k_bogus;
+
+        log_line("[run-online] activate node k=" + std::to_string(k) +
+                 ", new_edges=" + std::to_string(new_edges.size()) +
+                 ", closures_k=" + std::to_string(k_closure) +
+                 ", bogus_k=" + std::to_string(k_bogus));
+
+        if (new_edges.empty()) continue;
+
+        for (auto* edge : new_edges) {
+            step_counter_++;
+            log_line("[online step " + std::to_string(step_counter_) + "] edge (" +
+                     std::to_string(edge->a->index) + "," + std::to_string(edge->b->index) + ") type=" + std::to_string(edge->edge_type));
+
+            // MCTS로 최적 레이어 선택
+            std::string selected_layer = select_layer_by_uct();
+
+            // 방어적 가드: 레이어/인덱스 유효성 체크
+            auto* sel_layer_ptr = get_layer(selected_layer);
+            if (!sel_layer_ptr) {
+                log_line("[warn] selected layer not found: " + selected_layer);
+                continue;
+            }
+            int a_idx = edge->a->index;
+            int b_idx = edge->b->index;
+            if (a_idx < 0 || b_idx < 0 ||
+                a_idx >= (int)sel_layer_ptr->poses.size() ||
+                b_idx >= (int)sel_layer_ptr->poses.size()) {
+                log_line("[warn] edge node index OOB for layer poses: a=" + std::to_string(a_idx) +
+                         ", b=" + std::to_string(b_idx) +
+                         ", poses_size=" + std::to_string(sel_layer_ptr->poses.size()));
+                continue;
+            }
+
+            // Residual 기반 엣지 필터링 (고잔차 1회 재최적화 후 재평가 포함)
+            double residual = calculate_edge_residual(selected_layer, edge);
+            // if (residual >= config_.residual_high) {
+            //     log_line("[gate] online high residual; quick reopt up to k and recheck: " + std::to_string(residual));
+            //     optimize_layer_upto_k(selected_layer, online_active_k_ >= 0 ? online_active_k_ : k);
+            //     residual = calculate_edge_residual(selected_layer, edge);
+            //     log_line("[residual-recheck] online edge residual=" + std::to_string(residual));
+            //     if (residual >= config_.residual_high) {
+            //         log_line("[skip] online edge residual still high after reopt; skipping");
+            //         continue;
+            //     }
+            // }
+
+            // 확률적/임계 기반 엣지 추가 결정 (오프라인과 동일)
+            bool should_add = should_add_edge(selected_layer, edge, residual);
+            if (!should_add) {
+                log_line("[skip] edge not selected by probabilistic filtering");
+                continue;
+            }
+
+            // 분할 여부 판단 및 처리 (오프라인과 동일)
+            if (layers_.size() < config_.max_layers && should_split_layer(selected_layer, edge)) {
+                expand_layer(selected_layer, edge);
+            } else {
+                auto* layer = get_layer(selected_layer);
+                if (!layer) continue;
+                layer->added_edges.push_back(edge);
+                assignments_.emplace_back(edge, selected_layer);
+                if (layer->switch_vars.find(edge) == layer->switch_vars.end()) {
+                    layer->switch_vars[edge] = new double(1.0);
+                }
+
+                // 최상위 K 레이어에 엣지 전파(최적화는 best만)
+                if (config_.topk_layers > 0) {
+                    auto topk = get_topk_layers_by_reward(config_.topk_layers);
+                    std::string best_id = topk.empty() ? selected_layer : topk[0];
+                    propagate_edge_to_layers(edge, topk, best_id, selected_layer);
+                    // 온라인에선 best만 k 이하 최적화
+                    optimize_layer_upto_k(best_id, online_active_k_ >= 0 ? online_active_k_ : k);
+                } else {
+                    // K=0이면 현재 선택 레이어만 k 이하 최적화
+                    optimize_layer_upto_k(selected_layer, online_active_k_ >= 0 ? online_active_k_ : k);
+                }
+
+                // 보상 및 backpropagation
+                double reward = calculate_reward(selected_layer, edge);
+                backpropagate(selected_layer, reward);
+            }
+            // 스냅샷 저장 (요청 시)
+            if (config_.snapshot_every > 0 && (step_counter_ % config_.snapshot_every == 0)) {
+                save_snapshot(step_counter_);
+            }
+        }
+    }
+
+    // 처리 총계 검증 로그
+    int expected_closure = (int)g2o_.nEdgesClosure.size();
+    int expected_bogus = (int)g2o_.nEdgesBogus.size();
+    int expected_total = expected_closure + expected_bogus;
+    int missing_total = expected_total - total_processed_edges;
+    int missing_closure = expected_closure - total_processed_closure;
+    int missing_bogus = expected_bogus - total_processed_bogus;
+
+    log_line("[run-online][verify] processed_total=" + std::to_string(total_processed_edges) +
+             ", processed_closure=" + std::to_string(total_processed_closure) +
+             ", processed_bogus=" + std::to_string(total_processed_bogus));
+    log_line("[run-online][verify] expected_total=" + std::to_string(expected_total) +
+             ", expected_closure=" + std::to_string(expected_closure) +
+             ", expected_bogus=" + std::to_string(expected_bogus));
+    if (missing_total != 0 || missing_closure != 0 || missing_bogus != 0) {
+        log_line("[run-online][verify][warn] missing_total=" + std::to_string(missing_total) +
+                 ", missing_closure=" + std::to_string(missing_closure) +
+                 ", missing_bogus=" + std::to_string(missing_bogus));
+    } else {
+        log_line("[run-online][verify] all closure/bogus edges were processed exactly once");
+    }
+
+    save_results();
+    if (config_.snapshot_every > 0) {
+        save_snapshot(step_counter_);
+    }
+    log_line("[run-online] METHOD 4 ONLINE completed");
+}
+
+void SimpleLayerManagerV2::save_snapshot(int step_index)
+{
+    // 스냅샷 디렉토리 생성
+    std::filesystem::path snap_dir = std::filesystem::path(save_path_) / "snapshots";
+    std::error_code ec;
+    std::filesystem::create_directories(snap_dir, ec);
+
+    // 출력 파일명
+    std::ostringstream oss;
+    oss << "step_" << std::setw(4) << std::setfill('0') << step_index << ".png";
+    std::string out_png = (snap_dir / oss.str()).string();
+
+    // 온라인이면 현재 k 이하만 포함한 임시 save_path를 구성 (명시적으로 생성)
+    std::ostringstream oss2; 
+    oss2 << "step_" << std::setw(4) << std::setfill('0') << step_index << "_data";
+    std::filesystem::path snap_data_dir = snap_dir / oss2.str();
+    std::filesystem::create_directories(snap_data_dir, ec);
+
+    // 스냅샷 데이터 작성: init_nodes, best/visited/edges poses (k 이하로 자름)
+    int cap = (online_active_k_ >= 0 ? online_active_k_ : (int)g2o_.nNodes.size()-1);
+    // init
+    write_initial_poses_capped((snap_data_dir / "init_nodes.txt").string(), cap);
+    // layers
+    std::string best_id = get_best_layer();
+    std::string most_vis_id = get_most_visited_layer();
+    std::string most_edges_id = get_most_edges_layer();
+    write_layer_poses_capped(best_id, (snap_data_dir / "opt_nodes.txt").string(), cap);
+    write_layer_poses_capped(most_vis_id, (snap_data_dir / "opt_nodes_most_visited.txt").string(), cap);
+    write_layer_poses_capped(most_edges_id, (snap_data_dir / "opt_nodes_most_edges.txt").string(), cap);
+    // stats 복사 (그대로)
+    std::filesystem::path stats_src = std::filesystem::path(save_path_) / "method4_stats.txt";
+    std::filesystem::path stats_dst = snap_data_dir / "method4_stats.txt";
+    if (std::filesystem::exists(stats_src)) {
+        std::filesystem::copy_file(stats_src, stats_dst, std::filesystem::copy_options::overwrite_existing, ec);
+    }
+
+    // Python 스크립트 호출 (headless backend), 스냅샷 데이터 디렉토리를 save_path로 사용
+    std::string cmd = std::string("MPLBACKEND=Agg python ../drawer/plot_method4_results.py ") +
+                      "--save_path " + snap_data_dir.string() + " --output " + out_png +
+                      " --no-show > /dev/null 2>&1";
+    std::system(cmd.c_str());
+
+    log_line("[snapshot] saved " + out_png + " (cap k=" + std::to_string(cap) + ")");
+}
+
+void SimpleLayerManagerV2::write_layer_poses_capped(const std::string& layer_id, const std::string& filepath, int max_index)
+{
+    auto* layer = get_layer(layer_id);
+    if (!layer) return;
+    std::ofstream fp(filepath);
+    int n = std::min((int)layer->poses.size(), max_index + 1);
+    for (int i = 0; i < n; ++i) {
+        double* p = layer->poses[i];
+        fp << i << " " << p[0] << " " << p[1] << " " << p[2] << "\n";
+    }
+    fp.close();
+}
+
+void SimpleLayerManagerV2::write_initial_poses_capped(const std::string& filepath, int max_index)
+{
+    std::ofstream fp(filepath);
+    int n = std::min((int)g2o_.nNodes.size(), max_index + 1);
+    for (int i = 0; i < n; ++i) {
+        double* p = g2o_.nNodes[i]->p;
+        fp << i << " " << p[0] << " " << p[1] << " " << p[2] << "\n";
+    }
+    fp.close();
 }
 
 std::string SimpleLayerManagerV2::select_layer_by_uct()
@@ -218,8 +479,17 @@ void SimpleLayerManagerV2::expand_layer(const std::string& parent_id, Edge* new_
         if (parent_layer) {
             parent_layer->added_edges.push_back(new_edge);
             assignments_.emplace_back(new_edge, parent_id);
-            // 국소 최적화로 대체
-            optimize_local_window(parent_id, 20);
+            // best 레이어만 최적화
+            if (config_.topk_layers > 0) {
+                auto topk = get_topk_layers_by_reward(config_.topk_layers);
+                std::string best_id = topk.empty() ? parent_id : topk[0];
+                if (online_active_k_ >= 0) optimize_layer_upto_k(best_id, online_active_k_);
+                else optimize_layer(best_id);
+            } else {
+                // K=0이면 부모 레이어만 간단 최적화
+                if (online_active_k_ >= 0) optimize_layer_upto_k(parent_id, online_active_k_);
+                else optimize_layer(parent_id);
+            }
             double reward = calculate_reward(parent_id, new_edge);
             backpropagate(parent_id, reward);
         }
@@ -239,9 +509,7 @@ void SimpleLayerManagerV2::expand_layer(const std::string& parent_id, Edge* new_
     // 포함하는 레이어에 엣지 할당
     assignments_.emplace_back(new_edge, child_include_id);
     
-    // 두 자식 레이어 모두 최적화: 국소 최적화로 대체
-    optimize_local_window(child_include_id, 20);
-    // optimize_layer(child_exclude_id);
+    // 자식 레이어는 여기서 최적화하지 않음 (best 레이어에서만 최적화 수행)
     
     // 보상 계산 및 backpropagation
     double reward_include = calculate_reward(child_include_id, new_edge);
@@ -278,10 +546,21 @@ std::string SimpleLayerManagerV2::create_child_layer(const std::string& parent_i
     
     // 부모의 모든 엣지들을 상속받은 엣지로 설정
     child_layer->inherited_edges = parent->get_all_edges();
+
+    // 스위치 변수 생성/복사 (상속 엣지)
+    for (auto* e : child_layer->inherited_edges) {
+        double init_s = 1.0;
+        auto it = parent->switch_vars.find(e);
+        if (it != parent->switch_vars.end() && it->second) init_s = *(it->second);
+        child_layer->switch_vars[e] = new double(init_s);
+    }
     
     // 새 엣지 추가 여부 결정
     if (include_edge && new_edge) {
         child_layer->added_edges.push_back(new_edge);
+        if (child_layer->switch_vars.find(new_edge) == child_layer->switch_vars.end()) {
+            child_layer->switch_vars[new_edge] = new double(1.0);
+        }
     }
     
     std::string child_id = child_layer->id;
@@ -292,11 +571,12 @@ std::string SimpleLayerManagerV2::create_child_layer(const std::string& parent_i
 
 double SimpleLayerManagerV2::calculate_reward(const std::string& layer_id, Edge* added_edge)
 {
-    // r = −Δcost_rel + α·ΔH − β·n_lc(k)
+    // r = −Δcost_rel + α·ΔH − β·n_active_closure(k)
     
     double delta_cost_rel = calculate_cost_delta_rel(layer_id, added_edge);
     double info_gain = added_edge ? calculate_info_gain(added_edge) : 0.0;
-    int n_closure = count_closure_edges(layer_id, added_edge);
+    // 현재 활성(스위치 s > threshold)인 closure 개수
+    int n_closure = count_active_closure_edges(layer_id, online_active_k_);
     
     double reward = -delta_cost_rel + 
                    config_.alpha_info * info_gain - 
@@ -385,8 +665,34 @@ int SimpleLayerManagerV2::count_closure_edges(const std::string& layer_id, Edge*
     return count;
 }
 
+int SimpleLayerManagerV2::count_active_closure_edges(const std::string& layer_id, int k_lim) const
+{
+    auto it = layers_.find(layer_id);
+    if (it == layers_.end()) return 0;
+    const auto* layer = it->second.get();
+    int count = 0;
+    auto consider = [&](Edge* e){
+        if (!e) return;
+        if (e->edge_type != CLOSURE_EDGE) return;
+        int ia = e->a->index, ib = e->b->index;
+        if (k_lim >= 0 && std::max(ia, ib) > k_lim) return;
+        auto sit = layer->switch_vars.find(e);
+        double s = 1.0;
+        if (sit != layer->switch_vars.end() && sit->second) s = *(sit->second);
+        if (s > config_.sc_active_threshold) count++;
+    };
+    for (auto* e : layer->inherited_edges) consider(e);
+    for (auto* e : layer->added_edges) consider(e);
+    return count;
+}
+
 double SimpleLayerManagerV2::calculate_edge_residual(const std::string& layer_id, Edge* edge)
 {
+    // 모드 1: 포함/미포함 최적화 영향 기반 평가
+    if (config_.residual_mode == 1) {
+        return calculate_edge_residual_impact(layer_id, edge);
+    }
+
     auto* layer = get_layer(layer_id);
     if (!layer) return 1e6;
     
@@ -436,14 +742,152 @@ double SimpleLayerManagerV2::calculate_edge_residual(const std::string& layer_id
     info_matrix << edge->I11, edge->I12, edge->I13,
                    edge->I12, edge->I22, edge->I23,
                    edge->I13, edge->I23, edge->I33;
+    // 수치 안정화를 위해 대칭화
+    info_matrix = 0.5 * (info_matrix + info_matrix.transpose());
     
     double mahalanobis_dist = sqrt(residual.transpose() * info_matrix * residual);
     return mahalanobis_dist;
 }
 
-bool SimpleLayerManagerV2::should_add_edge(const std::string& layer_id, Edge* edge)
+double SimpleLayerManagerV2::calculate_edge_residual_impact(const std::string& layer_id, Edge* edge)
 {
-    double residual = calculate_edge_residual(layer_id, edge);
+    auto* layer = get_layer(layer_id);
+    if (!layer || !edge) return 1e6;
+
+    // 활성 노드 집합 구성: 온라인이면 [0..k], 아니면 impact_window 기반 또는 전체
+    std::set<int> active_nodes;
+    int a_idx = edge->a->index;
+    int b_idx = edge->b->index;
+    if (online_active_k_ >= 0 && config_.impact_window == 0) {
+        for (int i = 0; i <= online_active_k_ && i < (int)layer->poses.size(); ++i) active_nodes.insert(i);
+    } else if (config_.impact_window > 0) {
+        int radius = config_.impact_window;
+        int a0 = std::max(0, a_idx - radius);
+        int a1 = std::min((int)layer->poses.size() - 1, a_idx + radius);
+        int b0 = std::max(0, b_idx - radius);
+        int b1 = std::min((int)layer->poses.size() - 1, b_idx + radius);
+        for (int i = a0; i <= a1; ++i) active_nodes.insert(i);
+        for (int i = b0; i <= b1; ++i) active_nodes.insert(i);
+    } else {
+        for (int i = 0; i < (int)layer->poses.size(); ++i) active_nodes.insert(i);
+    }
+
+    // 임시 포즈 복사본 준비
+    int N = (int)layer->poses.size();
+    std::vector<double*> poses_base(N), poses_with(N);
+    for (int i = 0; i < N; ++i) {
+        poses_base[i] = new double[3]{layer->poses[i][0], layer->poses[i][1], layer->poses[i][2]};
+        poses_with[i] = new double[3]{layer->poses[i][0], layer->poses[i][1], layer->poses[i][2]};
+    }
+
+    // CERES 문제 구성
+    ceres::LossFunction* loss_base = new ceres::HuberLoss(config_.huber_delta);
+    ceres::LossFunction* loss_with = new ceres::HuberLoss(config_.huber_delta);
+    ceres::Problem prob_base, prob_with;
+    std::set<int> used_nodes_base, used_nodes_with;
+    int odom_base = 0, odom_with = 0, loop_base = 0, loop_with = 0;
+
+    auto add_edge_if_active = [&](ceres::Problem& prob, std::set<int>& used, Edge* e, std::vector<double*>& poses, ceres::LossFunction* loss, int& odc, int& lpc){
+        int ia = e->a->index, ib = e->b->index;
+        if (active_nodes.count(ia) && active_nodes.count(ib) && ia != ib) {
+            ceres::CostFunction* cost = OdometryResidue::Create(e->x, e->y, e->theta);
+            prob.AddResidualBlock(cost, loss, poses[ia], poses[ib]);
+            used.insert(ia);
+            used.insert(ib);
+            if (e->edge_type == ODOMETRY_EDGE) odc++; else lpc++;
+        }
+    };
+
+    // 오도메트리 엣지
+    for (auto* e : g2o_.nEdgesOdometry) {
+        add_edge_if_active(prob_base, used_nodes_base, e, poses_base, loss_base, odom_base, loop_base);
+        add_edge_if_active(prob_with, used_nodes_with, e, poses_with, loss_with, odom_with, loop_with);
+    }
+    // 레이어 엣지(상속+추가). 후보 엣지는 base에는 포함하지 않고 with에는 포함
+    auto layer_edges = layer->get_all_edges();
+    for (auto* e : layer_edges) {
+        if (e == edge) continue; // 후보 엣지는 분리 처리
+        add_edge_if_active(prob_base, used_nodes_base, e, poses_base, loss_base, odom_base, loop_base);
+        add_edge_if_active(prob_with, used_nodes_with, e, poses_with, loss_with, odom_with, loop_with);
+    }
+    // 후보 엣지는 with에만 추가
+    add_edge_if_active(prob_with, used_nodes_with, edge, poses_with, loss_with, odom_with, loop_with);
+
+    // 앵커 설정
+    if (!used_nodes_base.empty()) {
+        int anchor = (used_nodes_base.count(0) ? 0 : *used_nodes_base.begin());
+        prob_base.SetParameterBlockConstant(poses_base[anchor]);
+    }
+    if (!used_nodes_with.empty()) {
+        int anchor = (used_nodes_with.count(0) ? 0 : *used_nodes_with.begin());
+        prob_with.SetParameterBlockConstant(poses_with[anchor]);
+    }
+
+    // 제약이 전혀 없는 경우 방어적 처리
+    if (used_nodes_base.empty() || (odom_base + loop_base) == 0) {
+        // base 문제가 비정상이면 영향 계산 불가 → 큰 값 반환
+        for (int i = 0; i < N; ++i) { delete[] poses_base[i]; delete[] poses_with[i]; }
+        log_line("[impact] base problem empty; returning large residual");
+        return 1e6;
+    }
+    if (used_nodes_with.empty() || (odom_with + loop_with) == 0) {
+        // with 문제가 비정상이면 영향 없음으로 간주
+        for (int i = 0; i < N; ++i) { delete[] poses_base[i]; delete[] poses_with[i]; }
+        log_line("[impact] with problem empty; returning small residual");
+        return 0.0;
+    }
+
+    // Solve
+    ceres::Solver::Options opts;
+    opts.max_num_iterations = std::max(1, config_.impact_iters);
+    opts.minimizer_progress_to_stdout = false;
+    opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    opts.num_threads = 1;
+    ceres::Solver::Summary sum_base, sum_with;
+    ceres::Solve(opts, &prob_base, &sum_base);
+    ceres::Solve(opts, &prob_with, &sum_with);
+
+    // 포즈 델타 측정 (활성 노드 교집합 기준)
+    std::set<int> used;
+    used.insert(used_nodes_base.begin(), used_nodes_base.end());
+    used.insert(used_nodes_with.begin(), used_nodes_with.end());
+    double accum = 0.0; int cnt = 0; double maxv = 0.0;
+    for (int i : used) {
+        double dx = poses_with[i][0] - poses_base[i][0];
+        double dy = poses_with[i][1] - poses_base[i][1];
+        double dth = poses_with[i][2] - poses_base[i][2];
+        while (dth > M_PI) dth -= 2 * M_PI;
+        while (dth < -M_PI) dth += 2 * M_PI;
+        double val = std::sqrt(dx*dx + dy*dy + config_.impact_theta_weight * dth*dth);
+        accum += val; cnt++;
+        if (val > maxv) maxv = val;
+    }
+    double pose_shift = (cnt > 0 ? accum / cnt : 0.0);
+
+    // 비용 증가(나쁨만 반영)
+    double bad_cost = std::max(0.0, sum_with.final_cost - sum_base.final_cost);
+    double impact = bad_cost + config_.impact_pose_weight * pose_shift;
+
+    // 메모리 정리
+    for (int i = 0; i < N; ++i) { delete[] poses_base[i]; delete[] poses_with[i]; }
+    // 디버그 로그
+    log_line("[impact] a=" + std::to_string(a_idx) + ", b=" + std::to_string(b_idx) +
+             ", used_base=" + std::to_string(used_nodes_base.size()) +
+             ", used_with=" + std::to_string(used_nodes_with.size()) +
+             ", odom_base=" + std::to_string(odom_base) + ", loop_base=" + std::to_string(loop_base) +
+             ", odom_with=" + std::to_string(odom_with) + ", loop_with=" + std::to_string(loop_with) +
+             ", cost_base=" + std::to_string(sum_base.final_cost) +
+             ", cost_with=" + std::to_string(sum_with.final_cost) +
+             ", pose_shift=" + std::to_string(pose_shift) +
+             ", impact=" + std::to_string(impact));
+
+    return impact;
+}
+
+bool SimpleLayerManagerV2::should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual)
+{
+    double residual = std::isnan(precomputed_residual) ? calculate_edge_residual(layer_id, edge)
+                                                      : precomputed_residual;
     
     // R_high 이상: skip
     if (residual >= config_.residual_high) {
@@ -470,16 +914,20 @@ void SimpleLayerManagerV2::optimize_layer(const std::string& layer_id)
                                layer->poses[edge->b->index]);
     }
     
-    // Layer의 loop/bogus edges (inherited + added)
+    // Layer의 loop/bogus edges (inherited + added) with switching constraints
     auto all_edges = layer->get_all_edges();
     for (auto* edge : all_edges) {
         int ia = edge->a->index, ib = edge->b->index;
         if (ia == ib) continue; // self-loop 방지
-        
-        ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
-        problem.AddResidualBlock(cost, loss, 
-                               layer->poses[ia], 
-                               layer->poses[ib]);
+        // Switchable constraint for closures/bogus
+        if (layer->switch_vars.find(edge) == layer->switch_vars.end()) {
+            layer->switch_vars[edge] = new double(1.0);
+        }
+        double* s = layer->switch_vars[edge];
+        ceres::CostFunction* cost = SwitchableClosureResidue::Create(edge->x, edge->y, edge->theta);
+        problem.AddResidualBlock(cost, loss, layer->poses[ia], layer->poses[ib], s);
+        ceres::CostFunction* prior = SwitchPriorResidue::Create(config_.sc_prior_lambda);
+        problem.AddResidualBlock(prior, nullptr, s);
     }
     
     // 첫 번째 pose 고정 (앵커)
@@ -495,6 +943,82 @@ void SimpleLayerManagerV2::optimize_layer(const std::string& layer_id)
     
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
+}
+
+void SimpleLayerManagerV2::optimize_layer_upto_k(const std::string& layer_id, int k)
+{
+    auto* layer = get_layer(layer_id);
+    if (!layer) return;
+
+    ceres::Problem problem;
+    ceres::LossFunction* loss = new ceres::HuberLoss(config_.huber_delta);
+
+    std::set<int> used_nodes;
+
+    // Odometry constraints only up to node index k
+    int odom_added = 0;
+    for (auto* edge : g2o_.nEdgesOdometry) {
+        int ia = edge->a->index;
+        int ib = edge->b->index;
+        if (std::max(ia, ib) <= k) {
+            ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
+            problem.AddResidualBlock(cost, loss, layer->poses[ia], layer->poses[ib]);
+            used_nodes.insert(ia);
+            used_nodes.insert(ib);
+            odom_added++;
+        }
+    }
+
+    // Layer loop/bogus edges (inherited + added) up to node index k, with switches
+    auto all_edges = layer->get_all_edges();
+    int loop_added = 0;
+    for (auto* edge : all_edges) {
+        int ia = edge->a->index, ib = edge->b->index;
+        if (ia == ib) continue;
+        if (std::max(ia, ib) <= k) {
+            if (layer->switch_vars.find(edge) == layer->switch_vars.end()) {
+                layer->switch_vars[edge] = new double(1.0);
+            }
+            double* s = layer->switch_vars[edge];
+            ceres::CostFunction* cost = SwitchableClosureResidue::Create(edge->x, edge->y, edge->theta);
+            problem.AddResidualBlock(cost, loss, layer->poses[ia], layer->poses[ib], s);
+            ceres::CostFunction* prior = SwitchPriorResidue::Create(config_.sc_prior_lambda);
+            problem.AddResidualBlock(prior, nullptr, s);
+            used_nodes.insert(ia);
+            used_nodes.insert(ib);
+            loop_added++;
+        }
+        b_add_loop_edges_ = true;
+    }
+
+    // Anchor among used nodes to remove gauge
+    if (!used_nodes.empty()) {
+        int anchor = (used_nodes.count(0) ? 0 : *used_nodes.begin());
+        problem.SetParameterBlockConstant(layer->poses[anchor]);
+    } else {
+        // 추가된 제약이 없다면 바로 반환
+        log_line("[opt<=k] no active constraints; skip solve (layer=" + layer_id + ", k=" + std::to_string(k) + ")");
+        return;
+    }
+
+    ceres::Solver::Options options;
+    options.max_num_iterations = std::max(1, 100);
+    options.minimizer_progress_to_stdout = false;
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.num_threads = std::thread::hardware_concurrency() != 0
+        ? std::thread::hardware_concurrency()
+        : 4;
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    // 간단한 요약 로그 (디버깅용)
+    log_line("[opt<=k] layer=" + layer_id + 
+             ", k=" + std::to_string(k) +
+             ", odom_added=" + std::to_string(odom_added) +
+             ", loop_added=" + std::to_string(loop_added) +
+             ", used_nodes=" + std::to_string(used_nodes.size()) +
+             ", final_cost=" + std::to_string(summary.final_cost));
 }
 
 void SimpleLayerManagerV2::optimize_local_window(const std::string& layer_id, int window_size)
@@ -537,14 +1061,16 @@ void SimpleLayerManagerV2::optimize_local_window(const std::string& layer_id, in
         }
     }
 
-    // Add the newly added edges (focus constraints)
+    // Add the newly added edges (focus constraints) only if endpoints are active
     for (auto* edge : layer->added_edges) {
         int ia = edge->a->index, ib = edge->b->index;
         if (ia == ib) continue;
-        ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
-        problem.AddResidualBlock(cost, loss, layer->poses[ia], layer->poses[ib]);
-        used_nodes.insert(ia);
-        used_nodes.insert(ib);
+        if (active_nodes.count(ia) && active_nodes.count(ib)) {
+            ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
+            problem.AddResidualBlock(cost, loss, layer->poses[ia], layer->poses[ib]);
+            used_nodes.insert(ia);
+            used_nodes.insert(ib);
+        }
     }
     
     // Fix a single anchor among used nodes to remove gauge.
@@ -581,7 +1107,10 @@ double SimpleLayerManagerV2::evaluate_layer_cost(const std::string& layer_id)
             layer->poses[i][2]
         };
     }
-    
+    // 임시 스위치 변수 (레퍼런스 값 복사) — 주소 안정성을 위해 unique_ptr 사용
+    std::vector<std::unique_ptr<double>> local_switches;
+    local_switches.reserve(layer->inherited_edges.size() + layer->added_edges.size());
+
     // Odometry constraints
     for (auto* edge : g2o_.nEdgesOdometry) {
         ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
@@ -592,16 +1121,24 @@ double SimpleLayerManagerV2::evaluate_layer_cost(const std::string& layer_id)
     
     // Layer edges (inherited + added)
     auto all_edges = layer->get_all_edges();
+    int k_lim = (online_active_k_ >= 0 ? online_active_k_ : std::numeric_limits<int>::max());
     for (auto* edge : all_edges) {
         int ia = edge->a->index, ib = edge->b->index;
         if (ia == ib) continue;
-        
-        ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
-        problem.AddResidualBlock(cost, loss, temp_poses[ia], temp_poses[ib]);
+        if (std::max(ia, ib) > k_lim) continue; // online 모드에선 k 이후 엣지 배제
+        // switchable constraint (임시 s)
+        double s_val = 1.0;
+        auto sit = layer->switch_vars.find(edge);
+        if (sit != layer->switch_vars.end() && sit->second) s_val = *(sit->second);
+        local_switches.emplace_back(new double(s_val));
+        double* s_ptr = local_switches.back().get();
+        ceres::CostFunction* cost = SwitchableClosureResidue::Create(edge->x, edge->y, edge->theta);
+        problem.AddResidualBlock(cost, loss, temp_poses[ia], temp_poses[ib], s_ptr);
+        ceres::CostFunction* prior = SwitchPriorResidue::Create(config_.sc_prior_lambda);
+        problem.AddResidualBlock(prior, nullptr, s_ptr);
     }
     
     problem.SetParameterBlockConstant(temp_poses[0]);
-    
     ceres::Solver::Options options;
     options.max_num_iterations = 1;
     options.minimizer_progress_to_stdout = false;
@@ -700,6 +1237,95 @@ std::string SimpleLayerManagerV2::get_most_edges_layer()
     }
     
     return most_edges_id;
+}
+
+std::vector<std::string> SimpleLayerManagerV2::get_topk_layers_by_reward(int k)
+{
+    std::vector<std::pair<std::string, double>> vec;
+    vec.reserve(layers_.size());
+    for (auto& p : layers_) {
+        auto* layer = p.second.get();
+        auto all_edges = layer->get_all_edges();
+        double score = normalize_reward_by_edge_count(layer->total_reward, (int)all_edges.size());
+        vec.emplace_back(p.first, score);
+    }
+    std::sort(vec.begin(), vec.end(), [](const auto& a, const auto& b){ return a.second > b.second; });
+    std::vector<std::string> out;
+    for (int i = 0; i < k && i < (int)vec.size(); ++i) out.push_back(vec[i].first);
+    return out;
+}
+
+std::vector<std::string> SimpleLayerManagerV2::get_parent_and_sibling_layers(const std::string& layer_id,
+                                                                             bool include_parent,
+                                                                             bool include_siblings)
+{
+    std::vector<std::string> result;
+    auto* layer = get_layer(layer_id);
+    if (!layer) return result;
+
+    // 부모가 없으면 전파 대상 없음 (루트)
+    if (layer->parent_id.empty()) return result;
+
+    std::unordered_set<std::string> uniq;
+
+    // 부모 포함
+    if (include_parent) {
+        uniq.insert(layer->parent_id);
+    }
+
+    // 형제 포함: 부모의 children 전체 (best 포함)
+    if (include_siblings) {
+        auto* parent = get_layer(layer->parent_id);
+        if (parent) {
+            for (const auto& cid : parent->children) {
+                uniq.insert(cid);
+            }
+        }
+    }
+
+    result.reserve(uniq.size());
+    for (const auto& id : uniq) result.push_back(id);
+    return result;
+}
+
+void SimpleLayerManagerV2::copy_poses(const std::string& src_layer, const std::string& dst_layer)
+{
+    auto* src = get_layer(src_layer);
+    auto* dst = get_layer(dst_layer);
+    if (!src || !dst) return;
+    if (src->poses.size() != dst->poses.size()) return;
+    for (size_t i = 0; i < src->poses.size(); ++i) {
+        dst->poses[i][0] = src->poses[i][0];
+        dst->poses[i][1] = src->poses[i][1];
+        dst->poses[i][2] = src->poses[i][2];
+    }
+}
+
+void SimpleLayerManagerV2::propagate_edge_to_layers(Edge* e, const std::vector<std::string>& layer_ids,
+                                                    const std::string& best_id, const std::string& exclude_id)
+{
+    for (const auto& id : layer_ids) {
+        if (id == exclude_id) continue;
+        auto* layer = get_layer(id);
+        if (!layer) continue;
+        // dedup: skip if already present
+        bool exists = false;
+        for (auto* ee : layer->added_edges) { if (ee == e) { exists = true; break; } }
+        if (!exists) {
+            for (auto* ee : layer->inherited_edges) { if (ee == e) { exists = true; break; } }
+        }
+        if (!exists) {
+            layer->added_edges.push_back(e);
+            assignments_.emplace_back(e, id);
+            // initialize a switch variable for new edge
+            if (layer->switch_vars.find(e) == layer->switch_vars.end()) {
+                layer->switch_vars[e] = new double(1.0);
+            }
+        }
+        if (config_.propagate_poses_from_best && !best_id.empty() && id != best_id) {
+            copy_poses(best_id, id);
+        }
+    }
 }
 
 void SimpleLayerManagerV2::save_results()
@@ -804,4 +1430,489 @@ void SimpleLayerManagerV2::log_line(const std::string& s)
         logfile_ << s << '\n';
         logfile_.flush();
     }
+}
+
+bool SimpleLayerManagerV2::should_merge_layer(const std::string& layer_id)
+{
+    if (layer_id.empty() || layer_id == base_layer_id_) return false;
+    auto* layer = get_layer(layer_id);
+    if (!layer) return false;
+    auto all_edges = layer->get_all_edges();
+    int edge_count = static_cast<int>(all_edges.size());
+    if (edge_count < config_.min_edges_to_merge) return false;
+    if (layer->visits <= 0) return false;
+    double normalized = normalize_reward_by_edge_count(layer->total_reward, edge_count);
+    log_line("[merge-eval] layer=" + layer_id +
+             ", visits=" + std::to_string(layer->visits) +
+             ", edges=" + std::to_string(edge_count) +
+             ", normalized=" + std::to_string(normalized) +
+             ", threshold=" + std::to_string(config_.merge_threshold));
+    return normalized >= config_.merge_threshold;
+}
+
+void SimpleLayerManagerV2::free_layer_poses(SimpleLayer* layer)
+{
+    if (!layer) return;
+    for (auto* p : layer->poses) {
+        delete[] p;
+    }
+    layer->poses.clear();
+}
+
+void SimpleLayerManagerV2::free_layer_switches(SimpleLayer* layer)
+{
+    if (!layer) return;
+    for (auto& kv : layer->switch_vars) {
+        delete kv.second;
+    }
+    layer->switch_vars.clear();
+}
+
+void SimpleLayerManagerV2::merge_layer_into_base(const std::string& layer_id)
+{
+    if (layer_id.empty() || layer_id == base_layer_id_) return;
+    auto it = layers_.find(layer_id);
+    if (it == layers_.end()) return;
+    SimpleLayer* child = it->second.get();
+    SimpleLayer* base = get_layer(base_layer_id_);
+    if (!base || !child) return;
+
+    // Base poses <- child poses (Option A)
+    if (base->poses.size() != child->poses.size()) {
+        log_line("[merge] pose size mismatch; abort merge");
+        return;
+    }
+    for (size_t i = 0; i < base->poses.size(); ++i) {
+        base->poses[i][0] = child->poses[i][0];
+        base->poses[i][1] = child->poses[i][1];
+        base->poses[i][2] = child->poses[i][2];
+    }
+
+    // Merge edges (dedup)
+    std::unordered_set<Edge*> exists;
+    exists.reserve(base->inherited_edges.size() + base->added_edges.size());
+    for (auto* e : base->inherited_edges) exists.insert(e);
+    for (auto* e : base->added_edges) exists.insert(e);
+    for (auto* e : child->added_edges) {
+        if (exists.insert(e).second) base->added_edges.push_back(e);
+    }
+
+    // Detach from parent children list
+    if (!child->parent_id.empty()) {
+        auto* parent = get_layer(child->parent_id);
+        if (parent) {
+            auto& vec = parent->children;
+            vec.erase(std::remove(vec.begin(), vec.end(), layer_id), vec.end());
+        }
+    }
+
+    // Remove child layer
+    free_layer_poses(child);
+    free_layer_switches(child);
+    layers_.erase(it);
+
+    log_line("[merge] merged layer " + layer_id + " into base " + base_layer_id_);
+}
+
+// =============================
+// METHOD 5: SimpleLayerManager2
+// =============================
+
+SimpleLayerManager2::SimpleLayerManager2(ReadG2O& g, const std::string& save_path, const SimpleLayer2Config& cfg)
+    : g2o_(g), save_path_(save_path), config_(cfg)
+{
+    node_added_.assign(g2o_.nNodes.size(), false);
+    // Apply robust loss to both odometry and loop/bogus constraints
+    loss_odom_ = new ceres::HuberLoss(config_.huber_delta);
+    loss_loop_ = new ceres::HuberLoss(config_.huber_delta);
+}
+
+SimpleLayerManager2::~SimpleLayerManager2()
+{
+    // free switch variables created
+    for (auto& kv : switch_vars_) {
+        delete kv.second;
+    }
+    // loss_loop_ owned here
+    delete loss_loop_;
+    delete loss_odom_;
+}
+
+void SimpleLayerManager2::run_online()
+{
+    const int N = static_cast<int>(g2o_.nNodes.size());
+    if (N == 0) return;
+
+    // Explicitly add and fix anchor node 0
+    if (!anchor_added_) {
+        problem_.AddParameterBlock(g2o_.nNodes[0]->p, 3);
+        problem_.SetParameterBlockConstant(g2o_.nNodes[0]->p);
+        node_added_[0] = true;
+        anchor_added_ = true;
+    }
+
+    auto add_node_if_needed = [&](int idx) {
+        if (idx < 0 || idx >= N) return;
+        if (!node_added_[idx]) {
+            problem_.AddParameterBlock(g2o_.nNodes[idx]->p, 3);
+            node_added_[idx] = true;
+        }
+    };
+
+    auto add_odometry_edge = [&](Edge* e) {
+        int ia = e->a->index, ib = e->b->index;
+        if (ia == ib) return; // guard
+        add_node_if_needed(ia);
+        add_node_if_needed(ib);
+        ceres::CostFunction* cost = OdometryResidue::Create(e->x, e->y, e->theta);
+        problem_.AddResidualBlock(cost, loss_odom_, e->a->p, e->b->p);
+    };
+
+    auto add_sc_edge = [&](Edge* e) {
+        int ia = e->a->index, ib = e->b->index;
+        if (ia == ib) return; // guard
+        add_node_if_needed(ia);
+        add_node_if_needed(ib);
+        double*& s = switch_vars_[e];
+        if (!s) s = new double(1.0);
+        ceres::CostFunction* cost = SwitchableClosureResidue::Create(e->x, e->y, e->theta);
+        problem_.AddResidualBlock(cost, loss_loop_, e->a->p, e->b->p, s);
+        ceres::CostFunction* prior = SwitchPriorResidue::Create(config_.sc_prior_lambda);
+        problem_.AddResidualBlock(prior, nullptr, s);
+        if (config_.bound_switch_01) {
+            problem_.SetParameterLowerBound(s, 0, 0.0);
+            problem_.SetParameterUpperBound(s, 0, 1.0);
+        }
+    };
+
+    int step = 0;
+    for (int k = 1; k < N; ++k) {
+        step++;
+        int add_odo = 0, add_cl = 0, add_bg = 0;
+
+        // Add odometry edges that become active at k
+        for (auto* e : g2o_.nEdgesOdometry) {
+            if (std::max(e->a->index, e->b->index) == k) {
+                add_odometry_edge(e);
+                add_odo++;
+            }
+        }
+
+        // Add closure edges: only detect loops from current node k to past nodes
+        for (auto* e : g2o_.nEdgesClosure) {
+            // Realistic online SLAM: current node k can only detect loops to past nodes
+            if ((e->a->index == k && e->b->index < k) || 
+                (e->b->index == k && e->a->index < k)) {
+                add_sc_edge(e);
+                add_cl++;
+                // METHOD 4-like reward (log only)
+                double rew = calculate_reward(k, e);
+                log_line("[m5-reward] k=" + std::to_string(k) +
+                         " edge(CLOSURE)=" + std::to_string(e->a->index) + "," + std::to_string(e->b->index) +
+                         " reward=" + std::to_string(rew));
+                b_add_loop_edges_ = true;
+            }
+        }
+
+        // Add bogus edges: only detect from current node k to past nodes
+        for (auto* e : g2o_.nEdgesBogus) {
+            // Realistic online SLAM: current node k can only detect bogus loops to past nodes
+            if ((e->a->index == k && e->b->index < k) || 
+                (e->b->index == k && e->a->index < k)) {
+                add_sc_edge(e);
+                add_bg++;
+                // METHOD 4-like reward (log only)
+                double rew = calculate_reward(k, e);
+                log_line("[m5-reward] k=" + std::to_string(k) +
+                         " edge(BOGUS)=" + std::to_string(e->a->index) + "," + std::to_string(e->b->index) +
+                         " reward=" + std::to_string(rew));
+                b_add_loop_edges_ = true;
+            }
+        }
+
+        log_line("[m5-online] k=" + std::to_string(k) +
+                 ", odom_added=" + std::to_string(add_odo) +
+                 ", closure_added=" + std::to_string(add_cl) +
+                 ", bogus_added=" + std::to_string(add_bg));
+
+        if(b_add_loop_edges_) {
+            // Short solve at each step
+            ceres::Solver::Options opts;
+            opts.max_num_iterations = std::max(1, config_.iters_per_step);
+            opts.minimizer_progress_to_stdout = false;
+            opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+            opts.num_threads = std::thread::hardware_concurrency() != 0
+                ? std::thread::hardware_concurrency()
+                : 4;
+            ceres::Solver::Summary sum;
+            ceres::Solve(opts, &problem_, &sum);
+            b_add_loop_edges_ = false;
+        }
+
+        // Short solve at each step
+        // ceres::Solver::Options opts;
+        // opts.max_num_iterations = std::max(1, config_.iters_per_step);
+        // opts.minimizer_progress_to_stdout = false;
+        // opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        // opts.num_threads = std::thread::hardware_concurrency() != 0
+        //     ? std::thread::hardware_concurrency()
+        //     : 4;
+        // ceres::Solver::Summary sum;
+        // ceres::Solve(opts, &problem_, &sum);
+
+        if (config_.snapshot_every > 0 && (step % config_.snapshot_every == 0)) {
+            // Create snapshot dirs (PNG + data) compatible with METHOD 4 plotter
+            std::filesystem::path snap_root = std::filesystem::path(save_path_) / "snapshots5";
+            std::error_code ec;
+            std::filesystem::create_directories(snap_root, ec);
+
+            // Names similar to method4
+            std::ostringstream oss_png, oss_data;
+            oss_png << "step_" << std::setw(4) << std::setfill('0') << k << ".png";
+            oss_data << "step_" << std::setw(4) << std::setfill('0') << k << "_data";
+            std::filesystem::path data_dir = snap_root / oss_data.str();
+            std::filesystem::create_directories(data_dir, ec);
+
+            // Write init poses (0..k)
+            {
+                std::ofstream fp((data_dir / "init_nodes.txt").string());
+                for (int i = 0; i <= k && i < N; ++i) {
+                    double* p = g2o_.nNodes[i]->p;
+                    fp << i << " " << p[0] << " " << p[1] << " " << p[2] << "\n";
+                }
+            }
+            // Write optimized poses (0..k) — Method 5 uses single global optimization
+            {
+                std::ofstream fp((data_dir / "opt_nodes.txt").string());
+                for (int i = 0; i <= k && i < N; ++i) {
+                    double* p = g2o_.nNodes[i]->p;
+                    fp << i << " " << p[0] << " " << p[1] << " " << p[2] << "\n";
+                }
+            }
+
+            // Minimal method4-compatible stats file
+            {
+                std::ofstream fp((data_dir / "method4_stats.txt").string());
+                fp << "# layer_id visits total_reward avg_reward normalized_reward total_edges inherited_edges added_edges\n";
+                // Single surrogate layer statistics
+                int total_edges = 0;
+                for (auto* e : g2o_.nEdgesOdometry) {
+                    int ia = e->a->index, ib = e->b->index;
+                    if (std::max(ia, ib) <= k) total_edges++;
+                }
+                for (auto* e : g2o_.nEdgesClosure) {
+                    int ia = e->a->index, ib = e->b->index;
+                    if (std::max(ia, ib) <= k) total_edges++;
+                }
+                for (auto* e : g2o_.nEdgesBogus) {
+                    int ia = e->a->index, ib = e->b->index;
+                    if (std::max(ia, ib) <= k) total_edges++;
+                }
+                fp << "L1 0 0 0 0 " << total_edges << " 0 " << total_edges << "\n";
+            }
+
+            // Render with METHOD 4 plotter for consistency
+
+
+            std::string out_png = (snap_root / oss_png.str()).string();
+            std::string cmd = std::string("MPLBACKEND=Agg python3 ../drawer/plot_method4_results.py ") +
+                              "--save_path " + data_dir.string() + " --output " + out_png +
+                              " --no-show > /dev/null 2>&1";
+            std::system(cmd.c_str());
+        }
+    }
+    ceres::Solver::Options opts;
+    opts.max_num_iterations = std::max(1, 100);
+    opts.minimizer_progress_to_stdout = false;
+    opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    opts.num_threads = std::thread::hardware_concurrency() != 0
+        ? std::thread::hardware_concurrency()
+        : 4;
+    ceres::Solver::Summary sum;
+    ceres::Solve(opts, &problem_, &sum);
+
+    // Save final results
+    save_nodes(save_path_ + "/opt_nodes.txt");
+    save_switches(save_path_ + "/switches.txt");
+}
+
+void SimpleLayerManager2::log_line(const std::string& s)
+{
+    std::cout << s << std::endl;
+}
+
+void SimpleLayerManager2::save_nodes(const std::string& filepath)
+{
+    std::ofstream fp(filepath);
+    for (size_t i = 0; i < g2o_.nNodes.size(); ++i) {
+        double* p = g2o_.nNodes[i]->p;
+        fp << i << " " << p[0] << " " << p[1] << " " << p[2] << "\n";
+    }
+}
+
+void SimpleLayerManager2::save_switches(const std::string& filepath)
+{
+    // Build priors and optimized arrays in order: closures first, then bogus
+    std::vector<double> priors;
+    std::vector<double*> optimized;
+    priors.reserve(g2o_.nEdgesClosure.size() + g2o_.nEdgesBogus.size());
+    optimized.reserve(g2o_.nEdgesClosure.size() + g2o_.nEdgesBogus.size());
+
+    auto push_for = [&](const std::vector<Edge*>& vec) {
+        for (auto* e : vec) {
+            priors.push_back(1.0);
+            auto it = switch_vars_.find(e);
+            if (it != switch_vars_.end()) optimized.push_back(it->second);
+            else {
+                // If not created (edge never added online), create a dummy 1.0 value
+                double* s = new double(1.0);
+                switch_vars_[e] = s;
+                optimized.push_back(s);
+            }
+        }
+    };
+
+    push_for(g2o_.nEdgesClosure);
+    push_for(g2o_.nEdgesBogus);
+
+    // Reuse writer format
+    std::ofstream fp(filepath);
+    fp << "Odometry EDGES AHEAD\n";
+    for (auto* ed : g2o_.nEdgesOdometry) {
+        fp << ed->a->index << " " << ed->b->index << " " << ed->edge_type << " " << 1.0 << " " << 1.0 << "\n";
+    }
+    fp << "Closure EDGES AHEAD\n";
+    for (size_t i = 0; i < g2o_.nEdgesClosure.size(); ++i) {
+        auto* ed = g2o_.nEdgesClosure[i];
+        fp << ed->a->index << " " << ed->b->index << " " << ed->edge_type << " "
+           << priors[i] << " " << *(optimized[i]) << "\n";
+    }
+    fp << "BOGUS EDGES AHEAD\n";
+    size_t of = g2o_.nEdgesClosure.size();
+    for (size_t i = 0; i < g2o_.nEdgesBogus.size(); ++i) {
+        auto* ed = g2o_.nEdgesBogus[i];
+        fp << ed->a->index << " " << ed->b->index << " " << ed->edge_type << " "
+           << priors[of + i] << " " << *(optimized[of + i]) << "\n";
+    }
+}
+
+// ---- METHOD 4-like reward components for METHOD 5 ----
+
+double SimpleLayerManager2::calculate_info_gain(Edge* edge)
+{
+    if (!edge) return 0.0;
+    Eigen::Matrix3d Omega;
+    Omega << edge->I11, edge->I12, edge->I13,
+             edge->I12, edge->I22, edge->I23,
+             edge->I13, edge->I23, edge->I33;
+    Omega = 0.5 * (Omega + Omega.transpose());
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(Omega);
+    Eigen::Vector3d evals = solver.eigenvalues().cwiseMax(1e-12);
+    double logdet = 0.0;
+    for (int i = 0; i < 3; ++i) logdet += std::log(1.0 + evals[i]);
+    return 0.5 * logdet;
+}
+
+int SimpleLayerManager2::count_active_closure_edges_upto_k(int k) const
+{
+    int cnt = 0;
+    auto consider = [&](Edge* e){
+        if (!e) return;
+        if (e->edge_type != CLOSURE_EDGE) return;
+        int ia = e->a->index, ib = e->b->index;
+        if (std::max(ia, ib) > k) return;
+        double s = 1.0;
+        auto it = switch_vars_.find(e);
+        if (it != switch_vars_.end() && it->second) s = *(it->second);
+        if (s > config_.sc_active_threshold) cnt++;
+    };
+    for (auto* e : g2o_.nEdgesClosure) consider(e);
+    // bogus edges are not counted as closures here
+    return cnt;
+}
+
+double SimpleLayerManager2::evaluate_global_cost_upto_k(int k, Edge* exclude_edge, bool include_candidate)
+{
+    // Build a temporary problem with pose copies and local switch copies
+    const int N = static_cast<int>(g2o_.nNodes.size());
+    k = std::min(k, N - 1);
+    if (k < 0) return 0.0;
+
+    std::vector<double*> temp_poses(N);
+    for (int i = 0; i < N; ++i) {
+        temp_poses[i] = new double[3]{g2o_.nNodes[i]->p[0], g2o_.nNodes[i]->p[1], g2o_.nNodes[i]->p[2]};
+    }
+
+    std::vector<std::unique_ptr<double>> local_switches; // for closures/bogus
+    ceres::Problem prob;
+    ceres::LossFunction* loss = new ceres::HuberLoss(config_.huber_delta);
+
+    // Odometry up to k
+    for (auto* e : g2o_.nEdgesOdometry) {
+        int ia = e->a->index, ib = e->b->index;
+        if (std::max(ia, ib) <= k) {
+            ceres::CostFunction* c = OdometryResidue::Create(e->x, e->y, e->theta);
+            prob.AddResidualBlock(c, loss, temp_poses[ia], temp_poses[ib]);
+        }
+    }
+
+    auto add_sc_local = [&](Edge* e){
+        int ia = e->a->index, ib = e->b->index;
+        if (ia == ib) return;
+        if (std::max(ia, ib) > k) return;
+        double s_val = 1.0;
+        auto it = switch_vars_.find(e);
+        if (it != switch_vars_.end() && it->second) s_val = *(it->second);
+        local_switches.emplace_back(new double(s_val));
+        double* s_ptr = local_switches.back().get();
+        ceres::CostFunction* c = SwitchableClosureResidue::Create(e->x, e->y, e->theta);
+        prob.AddResidualBlock(c, loss, temp_poses[ia], temp_poses[ib], s_ptr);
+        ceres::CostFunction* prior = SwitchPriorResidue::Create(config_.sc_prior_lambda);
+        prob.AddResidualBlock(prior, nullptr, s_ptr);
+    };
+
+    // Closures up to k (excluding candidate if requested)
+    for (auto* e : g2o_.nEdgesClosure) {
+        if (e == exclude_edge && !include_candidate) continue;
+        add_sc_local(e);
+    }
+    // Bogus up to k (excluding candidate if requested)
+    for (auto* e : g2o_.nEdgesBogus) {
+        if (e == exclude_edge && !include_candidate) continue;
+        add_sc_local(e);
+    }
+
+    // If include_candidate=false, it was excluded above; if true, it was included by the loops.
+
+    // Anchor among used indices (prefer 0)
+    prob.SetParameterBlockConstant(temp_poses[0]);
+
+    ceres::Solver::Options opts;
+    opts.max_num_iterations = 1;
+    opts.minimizer_progress_to_stdout = false;
+    opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    ceres::Solver::Summary sum;
+    ceres::Solve(opts, &prob, &sum);
+
+    double cost = sum.final_cost;
+    for (int i = 0; i < N; ++i) delete[] temp_poses[i];
+    return cost;
+}
+
+double SimpleLayerManager2::calculate_cost_delta_rel(int k, Edge* added_edge)
+{
+    if (!added_edge) return 0.0;
+    double Li_prev = evaluate_global_cost_upto_k(k, added_edge, false);
+    double Li = evaluate_global_cost_upto_k(k, added_edge, true);
+    return (Li - Li_prev) / (config_.epsilon + Li_prev);
+}
+
+double SimpleLayerManager2::calculate_reward(int k, Edge* added_edge)
+{
+    double dcost_rel = calculate_cost_delta_rel(k, added_edge);
+    double info_gain = calculate_info_gain(added_edge);
+    int n_active = count_active_closure_edges_upto_k(k);
+    double reward = -dcost_rel + config_.alpha_info * info_gain - config_.beta_sparse * (double)n_active;
+    if (reward > 1.0) reward = 1.0; if (reward < -1.0) reward = -1.0;
+    return reward;
 }

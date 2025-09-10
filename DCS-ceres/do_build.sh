@@ -7,7 +7,8 @@ cd build
 rm -rf *
 cmake ..
 make -j8
-./main $1 $2 $3
+# Forward all CLI args to the binary so extra flags like --online work
+./main "$@"
 
 cd ..
 
