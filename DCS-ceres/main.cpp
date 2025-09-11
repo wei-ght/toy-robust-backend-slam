@@ -9,10 +9,8 @@
 #include "ceres_error.h"
 #include "g2o_util.h"
 #include "graph.h"
-#if 0
-#include "layer_manager.h" // METHOD 3 removed
-#endif
-#include "simple_layer_manager.h"
+#include "simple_layer_manager.h" // METHOD 4 + METHOD 5
+#include "simple_layer_manager6.h" // METHOD 6
 
 using std::cout;
 using std::endl;
@@ -183,7 +181,7 @@ auto main(int argc, char *argv[]) ->int
 
     // METHOD 3 removed
 
-    // METHOD 4: Simple layer MCTS with 30% expansion probability
+    // METHOD 4: Layer Manager (MCTS-based layering)
     if (!ONLINE && METHOD==4) {
         SimpleLayerConfig cfg; // defaults with 30% expansion, MCTS parameters
         SimpleLayerManagerV2 manager(g2o_manager, SAVE_PATH, cfg);
@@ -205,6 +203,13 @@ auto main(int argc, char *argv[]) ->int
             SimpleLayerManagerV2 manager(g2o_manager, SAVE_PATH, cfg);
             manager.run_online();
             // Also dump init/edges for consistency with plotting
+            g2o_manager.writePoseGraph_nodes(SAVE_PATH+"/init_nodes.txt");
+            g2o_manager.writePoseGraph_edges(SAVE_PATH+"/init_edges.txt");
+            return 0;
+        }
+        if (METHOD==6) {
+            SimpleLayer6Config cfg6; SimpleLayerManager6 manager(g2o_manager, SAVE_PATH, cfg6);
+            manager.run_online();
             g2o_manager.writePoseGraph_nodes(SAVE_PATH+"/init_nodes.txt");
             g2o_manager.writePoseGraph_edges(SAVE_PATH+"/init_edges.txt");
             return 0;

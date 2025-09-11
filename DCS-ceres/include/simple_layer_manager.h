@@ -25,24 +25,30 @@ struct SimpleLayerConfig
     double huber_delta = 0.01;
     double ema_alpha = 0.1;
     double epsilon = 1e-3;
-    double conflict_tau = 2.5; // 분할 결정 임계값 (Δ = L_ij - min(L_i, L_e))
+    double conflict_tau = 0.5; // 분할 결정 임계값 (Δ = L_ij - min(L_i, L_e))
     
     // Snapshot/Visualization
-    int snapshot_every = 5; // 0이면 비활성화, N>0이면 N스텝마다 스냅샷 저장
+    int snapshot_every = 20; // 0이면 비활성화, N>0이면 N스텝마다 스냅샷 저장
     
     // MCTS reward 파라미터
-    double alpha_info = 1.1;         // ΔH 정보 이득 가중치
-    double beta_sparse = 0.1;       // n_lc 희소성 페널티 가중치
+    double alpha_info = 0.4;         // ΔH 정보 이득 가중치
+    double beta_sparse = 0.2;       // n_lc 희소성 페널티 가중치
     double mcts_exploration_c = 1.414; // UCT 탐색 상수
     
     // Residual 기반 엣지 필터링
     double residual_low = 0.0;        // 모드 0: Mahalanobis 기준의 저역 게이트
-    double residual_high = 4.6;     // 모드 0: Mahalanobis 기준의 고역 게이트
+    double residual_high = 0.8;     // 모드 0: Mahalanobis 기준의 고역 게이트
     int residual_mode = 1;            // 0: Mahalanobis, 1: 포함/미포함 최적화 영향 기반
     int impact_iters = 1;             // 모드 1: solve 반복 횟수
     int impact_window = 0;            // 모드 1: >0이면 a,b 주변 index window만 사용, 0이면 온라인 k 사용
     double impact_theta_weight = 1.0; // 모드 1: 포즈 델타 각도 가중치
     double impact_pose_weight = 1.0;  // 모드 1: 포즈 델타 항의 가중치
+
+    // Neighbor residual improvement metric (for analysis; not enforced yet)
+    double neighbor_improve_abs_tau = 0.05;   // 절대 개선 임계 제안값
+    double neighbor_improve_rel_tau = 0.03;   // 상대 개선 임계 제안값
+    double neighbor_neg_slack = 0.005;        // 소폭 악화 허용 슬랙
+    double neighbor_theta_weight = 1.0;       // 이웃 잔차 각도 가중(기본=1)
 
     // Merge-to-base 정책
     double merge_threshold = 0.4;     // 정규화 보상이 이 값 이상이면 Base로 머지
@@ -125,6 +131,14 @@ private:
     // Residual 기반 필터링
     double calculate_edge_residual(const std::string& layer_id, Edge* edge);
     double calculate_edge_residual_impact(const std::string& layer_id, Edge* edge);
+    // 새 엣지 추가 전/후로, 해당 엣지와 노드를 공유하는 인접 엣지들의
+    // residual 합(또는 평균)이 얼마나 개선되는지(감소) 측정하는 척도
+    // 반환: sum_residual_before - sum_residual_after (양수면 개선)
+    double calculate_neighbor_residual_improvement(const std::string& layer_id, Edge* edge);
+    // 임시 레이어 기반 엣지 평가/병합 파이프라인
+    void process_edge_with_temp_layer(const std::string& parent_id, Edge* edge);
+    double compute_neighbor_improvement_between_layers(const std::string& parent_id, const std::string& child_id, Edge* edge);
+    void merge_child_into_parent_and_delete(const std::string& parent_id, const std::string& child_id, Edge* edge);
     bool should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual = std::numeric_limits<double>::quiet_NaN());
     
     // 최적화
@@ -189,7 +203,7 @@ struct SimpleLayer2Config
     int iters_per_step = 400;      // ceres iterations per online step
     double huber_delta = 0.05;   // robust kernel delta
     double sc_prior_lambda = 1.0; // prior weight for switch variables
-    int snapshot_every = 0;      // 0=off, >0 means save every N steps
+    int snapshot_every = 20;      // 0=off, >0 means save every N steps
     bool bound_switch_01 = true; // clamp s in [0,1]
 
     // Reward (borrowed from METHOD 4)

@@ -64,5 +64,61 @@ public:
 private:
     double lambda; // weighting factor
 };
+// PoseGraph2dErrorTerm with 1D blocks per parameter (x,y,yaw for A and B)
+class PoseGraph2dErrorTerm {
+ public:
+  PoseGraph2dErrorTerm(double x_ab,
+                       double y_ab,
+                       double yaw_ab_radians,
+                       const Eigen::Matrix3d& sqrt_information)
+      : p_ab_(x_ab, y_ab),
+        yaw_ab_radians_(yaw_ab_radians),
+        sqrt_information_(sqrt_information) {}
+
+  template <typename T>
+  bool operator()(const T* const x_a,
+                  const T* const y_a,
+                  const T* const yaw_a,
+                  const T* const x_b,
+                  const T* const y_b,
+                  const T* const yaw_b,
+                  T* residuals_ptr) const {
+    const Eigen::Matrix<T, 2, 1> p_a(*x_a, *y_a);
+    const Eigen::Matrix<T, 2, 1> p_b(*x_b, *y_b);
+
+    Eigen::Map<Eigen::Matrix<T, 3, 1>> residuals_map(residuals_ptr);
+
+    const T ca = ceres::cos(*yaw_a);
+    const T sa = ceres::sin(*yaw_a);
+    Eigen::Matrix<T,2,2> R_a;
+    R_a << ca, -sa,
+           sa,  ca;
+
+    residuals_map.template head<2>() =
+        R_a.transpose() * (p_b - p_a) - p_ab_.template cast<T>();
+
+    T dyaw = (*yaw_b - *yaw_a) - static_cast<T>(yaw_ab_radians_);
+    dyaw = ceres::atan2(ceres::sin(dyaw), ceres::cos(dyaw));
+    residuals_map(2) = dyaw;
+
+    residuals_map = sqrt_information_.template cast<T>() * residuals_map;
+    return true;
+  }
+
+  static ceres::CostFunction* Create(double x_ab,
+                                     double y_ab,
+                                     double yaw_ab_radians,
+                                     const Eigen::Matrix3d& sqrt_information) {
+    return (new ceres::AutoDiffCostFunction<PoseGraph2dErrorTerm, 3, 1, 1, 1, 1, 1, 1>(
+        new PoseGraph2dErrorTerm(x_ab, y_ab, yaw_ab_radians, sqrt_information)));
+  }
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+ private:
+  const Eigen::Vector2d p_ab_;
+  const double yaw_ab_radians_;
+  const Eigen::Matrix3d sqrt_information_;
+};
 
 #endif // CERES_ERROR_H

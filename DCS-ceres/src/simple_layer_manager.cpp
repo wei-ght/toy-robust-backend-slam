@@ -96,9 +96,9 @@ void SimpleLayerManagerV2::run()
         
         // Residual 기반 엣지 필터링 (+ 고잔차 1회 재최적화 후 재평가)
         double residual = calculate_edge_residual(selected_layer, edge);
-        log_line("[residual] edge residual=" + std::to_string(residual) +
-                 ", low=" + std::to_string(config_.residual_low) +
-                 ", high=" + std::to_string(config_.residual_high));
+        // log_line("[residual] edge residual=" + std::to_string(residual) +
+        //          ", low=" + std::to_string(config_.residual_low) +
+        //          ", high=" + std::to_string(config_.residual_high));
 
         // if (residual >= config_.residual_high) {
         //     // 빠른 국소 최적화 후 한 번 더 평가
@@ -113,52 +113,14 @@ void SimpleLayerManagerV2::run()
         // }
         
         // R_low 이하이거나 확률적 선택으로 엣지 추가 결정
-        bool should_add = should_add_edge(selected_layer, edge, residual);
-        if (!should_add) {
-            log_line("[skip] edge not selected by probabilistic filtering");
-            continue;
-        }
+        // bool should_add = should_add_edge(selected_layer, edge, residual);
+        // if (!should_add) {
+        //     log_line("[skip] edge not selected by probabilistic filtering");
+        //     continue;
+        // }
         
-        // 엣지 추가 후 레이어 분할 여부 결정
-        if (layers_.size() < config_.max_layers && should_split_layer(selected_layer, edge)) {
-            expand_layer(selected_layer, edge);
-            // 분기 후 Top-K 전파 및 best만 최적화
-            if (config_.topk_layers > 0) {
-                auto topk = get_topk_layers_by_reward(config_.topk_layers);
-                std::string best_id = topk.empty() ? selected_layer : topk[0];
-                propagate_edge_to_layers(edge, topk, best_id, "");
-                optimize_layer(best_id);
-            }
-        } else {
-            // 기존 레이어에 엣지 추가
-            auto* layer = get_layer(selected_layer);
-        if (layer) {
-            layer->added_edges.push_back(edge);
-            assignments_.emplace_back(edge, selected_layer);
-            if (layer->switch_vars.find(edge) == layer->switch_vars.end()) {
-                layer->switch_vars[edge] = new double(1.0);
-            }
-
-                // 최상위 K 레이어에 엣지 전파(최적화는 best만)
-                if (config_.topk_layers > 0) {
-                    auto topk = get_topk_layers_by_reward(config_.topk_layers);
-                    std::string best_id = topk.empty() ? selected_layer : topk[0];
-                    propagate_edge_to_layers(edge, topk, best_id, selected_layer);
-                    // best 레이어에만 최적화 수행
-                    optimize_layer(best_id);
-                } else {
-                    // K=0이면 현재 선택 레이어만 최적화
-                    optimize_layer(selected_layer);
-                }
-
-                // 보상 계산 및 backpropagation
-                double reward = calculate_reward(selected_layer, edge);
-                backpropagate(selected_layer, reward);
-
-                log_line("[assign] edge to existing layer " + selected_layer +
-                         ", reward=" + std::to_string(reward));
-            }
-        }
+        // 임시 레이어 개선 기반 파이프라인 적용 (Top-K는 병합 시 수행)
+        process_edge_with_temp_layer(selected_layer, edge);
         // 스냅샷 저장 (요청 시)
         if (config_.snapshot_every > 0 && (step_counter_ % config_.snapshot_every == 0)) {
             save_snapshot(step_counter_);
@@ -239,6 +201,8 @@ void SimpleLayerManagerV2::run_online()
 
             // Residual 기반 엣지 필터링 (고잔차 1회 재최적화 후 재평가 포함)
             double residual = calculate_edge_residual(selected_layer, edge);
+            log_line("[residual] edge residual=" + std::to_string(residual));
+
             // if (residual >= config_.residual_high) {
             //     log_line("[gate] online high residual; quick reopt up to k and recheck: " + std::to_string(residual));
             //     optimize_layer_upto_k(selected_layer, online_active_k_ >= 0 ? online_active_k_ : k);
@@ -257,34 +221,8 @@ void SimpleLayerManagerV2::run_online()
                 continue;
             }
 
-            // 분할 여부 판단 및 처리 (오프라인과 동일)
-            if (layers_.size() < config_.max_layers && should_split_layer(selected_layer, edge)) {
-                expand_layer(selected_layer, edge);
-            } else {
-                auto* layer = get_layer(selected_layer);
-                if (!layer) continue;
-                layer->added_edges.push_back(edge);
-                assignments_.emplace_back(edge, selected_layer);
-                if (layer->switch_vars.find(edge) == layer->switch_vars.end()) {
-                    layer->switch_vars[edge] = new double(1.0);
-                }
-
-                // 최상위 K 레이어에 엣지 전파(최적화는 best만)
-                if (config_.topk_layers > 0) {
-                    auto topk = get_topk_layers_by_reward(config_.topk_layers);
-                    std::string best_id = topk.empty() ? selected_layer : topk[0];
-                    propagate_edge_to_layers(edge, topk, best_id, selected_layer);
-                    // 온라인에선 best만 k 이하 최적화
-                    optimize_layer_upto_k(best_id, online_active_k_ >= 0 ? online_active_k_ : k);
-                } else {
-                    // K=0이면 현재 선택 레이어만 k 이하 최적화
-                    optimize_layer_upto_k(selected_layer, online_active_k_ >= 0 ? online_active_k_ : k);
-                }
-
-                // 보상 및 backpropagation
-                double reward = calculate_reward(selected_layer, edge);
-                backpropagate(selected_layer, reward);
-            }
+            // 임시 레이어 개선 기반 파이프라인 적용 (Top-K는 병합 시 수행)
+            process_edge_with_temp_layer(selected_layer, edge);
             // 스냅샷 저장 (요청 시)
             if (config_.snapshot_every > 0 && (step_counter_ % config_.snapshot_every == 0)) {
                 save_snapshot(step_counter_);
@@ -420,7 +358,16 @@ std::string SimpleLayerManagerV2::select_layer_by_uct()
         double avg_reward = layer->total_reward / layer->visits;
         double exploration = config_.mcts_exploration_c * 
                             std::sqrt(std::log(total_visits) / layer->visits);
-        double uct_value = avg_reward + exploration;
+        
+        // Visit count bonus: 많이 방문된(성공적인) 레이어에 보너스
+        double visit_bonus = 0.0;
+        if (total_visits > 1) {
+            double visit_ratio = (double)layer->visits / (double)total_visits;
+            visit_bonus = 0.3 * visit_ratio; // TODO: expose via config (visit_bonus_weight)
+        }
+        
+        // double uct_value = avg_reward + exploration + visit_bonus;
+        double uct_value = avg_reward + visit_bonus;
         
         if (uct_value > best_uct_value) {
             best_uct_value = uct_value;
@@ -571,16 +518,64 @@ std::string SimpleLayerManagerV2::create_child_layer(const std::string& parent_i
 
 double SimpleLayerManagerV2::calculate_reward(const std::string& layer_id, Edge* added_edge)
 {
-    // r = −Δcost_rel + α·ΔH − β·n_active_closure(k)
+    // r = −Δcost_rel + α·ΔH − β·n_active_closure(k) − γ·outlier_penalty
     
     double delta_cost_rel = calculate_cost_delta_rel(layer_id, added_edge);
     double info_gain = added_edge ? calculate_info_gain(added_edge) : 0.0;
     // 현재 활성(스위치 s > threshold)인 closure 개수
     int n_closure = count_active_closure_edges(layer_id, online_active_k_);
     
+    // Outlier penalty based on chi2 value
+    double outlier_penalty = 0.0;
+    if (added_edge) {
+        auto* layer = get_layer(layer_id);
+        if (layer) {
+            int ia = added_edge->a->index, ib = added_edge->b->index;
+            if (ia >= 0 && ib >= 0 && ia < (int)layer->poses.size() && ib < (int)layer->poses.size()) {
+                // Chi2 계산을 위한 lambda (기존 코드에서 재사용)
+                auto wrap = [](double a){ while(a > M_PI) a -= 2*M_PI; while(a < -M_PI) a += 2*M_PI; return a; };
+                auto edge_chi2 = [&](double* pa, double* pb, const Edge* e){
+                    double dx = pb[0] - pa[0];
+                    double dy = pb[1] - pa[1];
+                    double dth = wrap(pb[2] - pa[2]);
+                    double ca = std::cos(pa[2]), sa = std::sin(pa[2]);
+                    double rel_x = ca*dx + sa*dy;
+                    double rel_y = -sa*dx + ca*dy;
+                    double rx = rel_x - e->x;
+                    double ry = rel_y - e->y;
+                    double rth = wrap(dth - e->theta);
+                    Eigen::Matrix<double,3,1> r; r << rx, ry, rth;
+                    Eigen::Matrix3d I;
+                    I << e->I11, e->I12, e->I13,
+                         e->I12, e->I22, e->I23,
+                         e->I13, e->I23, e->I33;
+                    I = 0.5 * (I + I.transpose());
+                    return (r.transpose() * I * r)(0,0);
+                };
+                
+                double edge_chi2_val = edge_chi2(layer->poses[ia], layer->poses[ib], added_edge);
+                
+                // Progressive penalty based on chi2 thresholds
+                const double chi2_threshold_95 = 7.815;   // 95% confidence
+                const double chi2_threshold_99 = 11.345;  // 99% confidence
+                const double gamma_outlier = 0.5; // TODO: expose via config
+                
+                if (edge_chi2_val > chi2_threshold_99) {
+                    // Very likely outlier: strong penalty
+                    outlier_penalty = gamma_outlier * 1.0;
+                } else if (edge_chi2_val > chi2_threshold_95) {
+                    // Suspicious: moderate penalty (linear interpolation)
+                    double ratio = (edge_chi2_val - chi2_threshold_95) / (chi2_threshold_99 - chi2_threshold_95);
+                    outlier_penalty = gamma_outlier * ratio;
+                }
+            }
+        }
+    }
+    
     double reward = -delta_cost_rel + 
                    config_.alpha_info * info_gain - 
-                   config_.beta_sparse * static_cast<double>(n_closure);
+                   config_.beta_sparse * static_cast<double>(n_closure) -
+                   outlier_penalty;
     
     // [-1, 1] 범위로 클리핑
     reward = std::max(-1.0, std::min(1.0, reward));
@@ -589,6 +584,7 @@ double SimpleLayerManagerV2::calculate_reward(const std::string& layer_id, Edge*
              ", delta_cost_rel=" + std::to_string(delta_cost_rel) +
              ", info_gain=" + std::to_string(info_gain) +
              ", n_closure=" + std::to_string(n_closure) +
+             ", outlier_penalty=" + std::to_string(outlier_penalty) +
              ", final_reward=" + std::to_string(reward));
     
     return reward;
@@ -690,9 +686,9 @@ double SimpleLayerManagerV2::calculate_edge_residual(const std::string& layer_id
 {
     // 모드 1: 포함/미포함 최적화 영향 기반 평가
     if (config_.residual_mode == 1) {
-        return calculate_edge_residual_impact(layer_id, edge);
+        // return calculate_edge_residual_impact(layer_id, edge);
+        return calculate_neighbor_residual_improvement(layer_id, edge);
     }
-
     auto* layer = get_layer(layer_id);
     if (!layer) return 1e6;
     
@@ -745,7 +741,8 @@ double SimpleLayerManagerV2::calculate_edge_residual(const std::string& layer_id
     // 수치 안정화를 위해 대칭화
     info_matrix = 0.5 * (info_matrix + info_matrix.transpose());
     
-    double mahalanobis_dist = sqrt(residual.transpose() * info_matrix * residual);
+    // double mahalanobis_dist = sqrt(residual.transpose() * info_matrix * residual);
+    double mahalanobis_dist = sqrt(residual.transpose() * residual);
     return mahalanobis_dist;
 }
 
@@ -816,10 +813,12 @@ double SimpleLayerManagerV2::calculate_edge_residual_impact(const std::string& l
     // 앵커 설정
     if (!used_nodes_base.empty()) {
         int anchor = (used_nodes_base.count(0) ? 0 : *used_nodes_base.begin());
+        prob_base.AddParameterBlock(poses_base[anchor], 3);
         prob_base.SetParameterBlockConstant(poses_base[anchor]);
     }
     if (!used_nodes_with.empty()) {
         int anchor = (used_nodes_with.count(0) ? 0 : *used_nodes_with.begin());
+        prob_with.AddParameterBlock(poses_with[anchor], 3);
         prob_with.SetParameterBlockConstant(poses_with[anchor]);
     }
 
@@ -884,6 +883,251 @@ double SimpleLayerManagerV2::calculate_edge_residual_impact(const std::string& l
     return impact;
 }
 
+// 새 엣지(edge)를 포함하기 전/후로, edge의 양 끝 노드(a,b)와 노드를 공유하는
+// 인접 엣지들의 residual 합이 얼마나 감소했는지 계산한다.
+// 반환값 = sum_residual_before - sum_residual_after (양수면 개선, 클수록 좋음)
+double SimpleLayerManagerV2::calculate_neighbor_residual_improvement(const std::string& layer_id, Edge* edge)
+{
+    auto* layer = get_layer(layer_id);
+    if (!layer || !edge) return 0.0;
+    // 로컬 윈도우 제거: 전체 노드/엣지를 대상으로 평가
+    int a_idx = edge->a->index;
+    int b_idx = edge->b->index;
+
+    // 포즈 복사본 준비
+    int N = (int)layer->poses.size();
+    std::vector<double*> poses_base(N), poses_with(N);
+    for (int i = 0; i < N; ++i) {
+        poses_base[i] = new double[3]{layer->poses[i][0], layer->poses[i][1], layer->poses[i][2]};
+        poses_with[i] = new double[3]{layer->poses[i][0], layer->poses[i][1], layer->poses[i][2]};
+    }
+
+    ceres::LossFunction* loss_base = new ceres::HuberLoss(config_.huber_delta);
+    ceres::LossFunction* loss_with = new ceres::HuberLoss(config_.huber_delta);
+    ceres::Problem prob_base, prob_with;
+    std::set<int> used_nodes_base, used_nodes_with;
+
+    auto add_edge_if_active = [&](ceres::Problem& prob, std::set<int>& used, Edge* e, std::vector<double*>& poses, ceres::LossFunction* loss){
+        int ia = e->a->index, ib = e->b->index;
+        if (ia == ib) return;
+        ceres::CostFunction* cost = OdometryResidue::Create(e->x, e->y, e->theta);
+        prob.AddResidualBlock(cost, loss, poses[ia], poses[ib]);
+        used.insert(ia);
+        used.insert(ib);
+    };
+
+    // 오도메트리 엣지
+    for (auto* e : g2o_.nEdgesOdometry) {
+        add_edge_if_active(prob_base, used_nodes_base, e, poses_base, loss_base);
+        add_edge_if_active(prob_with, used_nodes_with, e, poses_with, loss_with);
+    }
+    // 레이어 엣지(상속+추가), 후보 엣지는 base에선 제외, with에선 포함
+    auto layer_edges = layer->get_all_edges();
+    for (auto* e : layer_edges) {
+        if (e == edge) continue;
+        add_edge_if_active(prob_base, used_nodes_base, e, poses_base, loss_base);
+        add_edge_if_active(prob_with, used_nodes_with, e, poses_with, loss_with);
+    }
+    add_edge_if_active(prob_with, used_nodes_with, edge, poses_with, loss_with);
+
+    // 앵커 설정
+    if (!used_nodes_base.empty()) {
+        int anchor = (used_nodes_base.count(0) ? 0 : *used_nodes_base.begin());
+        prob_base.AddParameterBlock(poses_base[anchor], 3);
+        prob_base.SetParameterBlockConstant(poses_base[anchor]);
+    }
+    if (!used_nodes_with.empty()) {
+        int anchor = (used_nodes_with.count(0) ? 0 : *used_nodes_with.begin());
+        prob_with.AddParameterBlock(poses_with[anchor], 3);
+        prob_with.SetParameterBlockConstant(poses_with[anchor]);
+    }
+
+    // 풀기 (짧게)
+    ceres::Solver::Options opts;
+    opts.max_num_iterations = std::max(1, config_.impact_iters);
+    opts.minimizer_progress_to_stdout = false;
+    opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    opts.num_threads = 1;
+    ceres::Solver::Summary s0, s1;
+    ceres::Solve(opts, &prob_base, &s0);
+    ceres::Solve(opts, &prob_with, &s1);
+
+    // 인접 엣지 선택: edge와 노드를 공유하는 모든 엣지(오도메트리 + 레이어엣지), 후보 제외
+    std::vector<Edge*> neighbor_edges;
+    auto consider_neighbor = [&](Edge* e){
+        if (!e || e == edge) return;
+        int ia = e->a->index, ib = e->b->index;
+        if (ia == a_idx || ib == a_idx || ia == b_idx || ib == b_idx) {
+            neighbor_edges.push_back(e);
+        }
+    };
+    for (auto* e : g2o_.nEdgesOdometry) consider_neighbor(e);
+    for (auto* e : layer_edges) consider_neighbor(e);
+
+    // 잔차 계산 도우미 (L2, 각도 가중은 impact_theta_weight 재사용)
+    auto residual_norm_with_poses = [&](std::vector<double*>& poses, Edge* e){
+        int ia = e->a->index, ib = e->b->index;
+        if (ia < 0 || ib < 0 || ia >= N || ib >= N) return 0.0;
+        double* pa = poses[ia];
+        double* pb = poses[ib];
+        double dx = pb[0] - pa[0];
+        double dy = pb[1] - pa[1];
+        double dth = pb[2] - pa[2];
+        while (dth > M_PI) dth -= 2 * M_PI;
+        while (dth < -M_PI) dth += 2 * M_PI;
+        double ca = std::cos(pa[2]);
+        double sa = std::sin(pa[2]);
+        double rel_x = ca * dx + sa * dy;
+        double rel_y = -sa * dx + ca * dy;
+        double rx = rel_x - e->x;
+        double ry = rel_y - e->y;
+        double rth = dth - e->theta;
+        while (rth > M_PI) rth -= 2 * M_PI;
+        while (rth < -M_PI) rth += 2 * M_PI;
+        double wth = config_.neighbor_theta_weight;
+        return std::sqrt(rx*rx + ry*ry + wth * rth*rth);
+    };
+
+    double sum_before = 0.0, sum_after = 0.0;
+    for (auto* ne : neighbor_edges) {
+        sum_before += residual_norm_with_poses(poses_base, ne);
+        sum_after  += residual_norm_with_poses(poses_with, ne);
+    }
+
+    // 메모리 정리
+    for (int i = 0; i < N; ++i) { delete[] poses_base[i]; delete[] poses_with[i]; }
+
+    double improvement = sum_before - sum_after;
+    double rel_improvement = improvement / (1e-9 + sum_before);
+    log_line("[neighbor-improve] a=" + std::to_string(a_idx) + ", b=" + std::to_string(b_idx) +
+             ", neighbors=" + std::to_string(neighbor_edges.size()) +
+             ", sum_before=" + std::to_string(sum_before) +
+             ", sum_after=" + std::to_string(sum_after) +
+             ", improvement=" + std::to_string(improvement) +
+             ", rel_improve=" + std::to_string(rel_improvement));
+    return improvement;
+}
+
+// 부모/자식 레이어의 포즈를 각각 사용해 이웃 엣지 잔차 합의 개선량을 계산
+// (disabled) 부모/자식 레이어의 포즈를 각각 사용해 이웃 엣지 잔차 합의 개선량을 계산
+#if 0
+double SimpleLayerManagerV2::compute_neighbor_improvement_between_layers(const std::string& parent_id,
+                                                                         const std::string& child_id,
+                                                                         Edge* edge)
+{
+    return 0.0;
+}
+#endif
+
+void SimpleLayerManagerV2::merge_child_into_parent_and_delete(const std::string& parent_id,
+                                                              const std::string& child_id,
+                                                              Edge* edge)
+{
+    auto* parent = get_layer(parent_id);
+    auto* child = get_layer(child_id);
+    if (!parent || !child) return;
+
+    // 부모 포즈를 자식(최적화된) 포즈로 복사
+    copy_poses(child_id, parent_id);
+    // 부모에 엣지 반영 및 스위치 초기화
+    if (edge) {
+        bool exists = false;
+        for (auto* e : parent->added_edges) if (e == edge) { exists = true; break; }
+        if (!exists) parent->added_edges.push_back(edge);
+        if (parent->switch_vars.find(edge) == parent->switch_vars.end()) parent->switch_vars[edge] = new double(1.0);
+    }
+
+    // 부모 children 목록에서 child 제거
+    auto it = std::find(parent->children.begin(), parent->children.end(), child_id);
+    if (it != parent->children.end()) parent->children.erase(it);
+
+    // 메모리 해제 및 레이어 삭제
+    free_layer_poses(child);
+    free_layer_switches(child);
+    layers_.erase(child_id);
+
+    log_line("[merge] merged child " + child_id + " into parent " + parent_id + " and deleted child");
+}
+
+void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& parent_id, Edge* edge)
+{
+    auto* parent = get_layer(parent_id);
+    if (!parent || !edge) return;
+
+    // 1) 임시 레이어 생성 (엣지 포함)
+    std::string child_id = create_child_layer(parent_id, edge, true);
+    auto* parent_ptr = get_layer(parent_id);
+    if (parent_ptr) parent_ptr->children.push_back(child_id);
+
+    // 2) 임시 레이어 전체 최적화
+    optimize_layer(child_id);
+
+    // 3) Chi-squared 기반 엣지 필터링
+    auto wrap = [](double a){ while(a > M_PI) a -= 2*M_PI; while(a < -M_PI) a += 2*M_PI; return a; };
+    auto edge_chi2 = [&](double* pa, double* pb, const Edge* e){
+        double dx = pb[0] - pa[0];
+        double dy = pb[1] - pa[1];
+        double dth = wrap(pb[2] - pa[2]);
+        double ca = std::cos(pa[2]), sa = std::sin(pa[2]);
+        double rel_x = ca*dx + sa*dy;
+        double rel_y = -sa*dx + ca*dy;
+        double rx = rel_x - e->x;
+        double ry = rel_y - e->y;
+        double rth = wrap(dth - e->theta);
+        Eigen::Matrix<double,3,1> r; r << rx, ry, rth;
+        Eigen::Matrix3d I;
+        I << e->I11, e->I12, e->I13,
+             e->I12, e->I22, e->I23,
+             e->I13, e->I23, e->I33;
+        I = 0.5 * (I + I.transpose());
+        return (r.transpose() * I * r)(0,0);
+    };
+
+    // 새 엣지의 chi2 값만 확인 (최적화된 자식 레이어에서)
+    auto* child = get_layer(child_id);
+    if (!child) return;
+    
+    int ia = edge->a->index, ib = edge->b->index;
+    if (ia < 0 || ib < 0 || ia >= (int)child->poses.size() || ib >= (int)child->poses.size()) return;
+    
+    double new_edge_chi2 = edge_chi2(child->poses[ia], child->poses[ib], edge);
+    
+    // Chi-squared threshold for 3 DOF (95% confidence: 7.815, 99% confidence: 11.345)
+    const double chi2_threshold_95 = 7.815;  // TODO: expose via config
+    const double chi2_threshold_99 = 11.345; // TODO: expose via config
+    const double chi2_threshold = chi2_threshold_95; // Use 95% confidence by default
+    
+    log_line(std::string("[chi2-filter] new_edge_chi2=") + std::to_string(new_edge_chi2) +
+             ", threshold=" + std::to_string(chi2_threshold) +
+             ", edge=(" + std::to_string(ia) + "," + std::to_string(ib) + ")");
+
+    bool accept = (new_edge_chi2 < chi2_threshold);
+
+    if (accept) {
+        // 병합: 부모 포즈 갱신 + 엣지 추가 + 자식 삭제
+        merge_child_into_parent_and_delete(parent_id, child_id, edge);
+        // Top-K 전파 및 best 최적화
+        if (config_.topk_layers > 0) {
+            auto topk = get_topk_layers_by_reward(config_.topk_layers);
+            std::string best_id = topk.empty() ? parent_id : topk[0];
+            propagate_edge_to_layers(edge, topk, best_id, parent_id);
+            optimize_layer(best_id);
+        } else {
+            optimize_layer(parent_id);
+        }
+        // 보상/백프로파게이션(부모 기준)
+        double reward = calculate_reward(parent_id, edge);
+        backpropagate(parent_id, reward);
+    } else {
+        log_line("[chi2-decision] reject; keep child layer " + child_id);
+        // 기록용
+        assignments_.emplace_back(edge, child_id);
+        // 선택적으로 자식 보상 기록
+        double reward = calculate_reward(child_id, edge);
+        backpropagate(child_id, reward);
+    }
+}
+
 bool SimpleLayerManagerV2::should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual)
 {
     double residual = std::isnan(precomputed_residual) ? calculate_edge_residual(layer_id, edge)
@@ -906,14 +1150,14 @@ void SimpleLayerManagerV2::optimize_layer(const std::string& layer_id)
     ceres::Problem problem;
     ceres::LossFunction* loss = new ceres::HuberLoss(config_.huber_delta);
     
-    // Odometry constraints
+    // Odometry constraints (add all, like method 5 after full accumulation)
     for (auto* edge : g2o_.nEdgesOdometry) {
         ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
         problem.AddResidualBlock(cost, loss, 
                                layer->poses[edge->a->index], 
                                layer->poses[edge->b->index]);
     }
-    
+
     // Layer의 loop/bogus edges (inherited + added) with switching constraints
     auto all_edges = layer->get_all_edges();
     for (auto* edge : all_edges) {
@@ -930,17 +1174,20 @@ void SimpleLayerManagerV2::optimize_layer(const std::string& layer_id)
         problem.AddResidualBlock(prior, nullptr, s);
     }
     
-    // 첫 번째 pose 고정 (앵커)
+    // Fix first pose (anchor). Ensure it's registered.
     if (!layer->poses.empty()) {
+        problem.AddParameterBlock(layer->poses[0], 3);
         problem.SetParameterBlockConstant(layer->poses[0]);
     }
     
+
     ceres::Solver::Options options;
     options.max_num_iterations = std::max(1, config_.local_iters);
     options.minimizer_progress_to_stdout = false;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.num_threads = 1;
-    
+    options.num_threads = std::thread::hardware_concurrency() != 0
+        ? std::thread::hardware_concurrency()
+        : 4;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 }
@@ -952,10 +1199,10 @@ void SimpleLayerManagerV2::optimize_layer_upto_k(const std::string& layer_id, in
 
     ceres::Problem problem;
     ceres::LossFunction* loss = new ceres::HuberLoss(config_.huber_delta);
-
+    
     std::set<int> used_nodes;
-
-    // Odometry constraints only up to node index k
+    
+    // Odometry constraints only up to node index k (like method 5 accumulated up to k)
     int odom_added = 0;
     for (auto* edge : g2o_.nEdgesOdometry) {
         int ia = edge->a->index;
@@ -988,12 +1235,12 @@ void SimpleLayerManagerV2::optimize_layer_upto_k(const std::string& layer_id, in
             used_nodes.insert(ib);
             loop_added++;
         }
-        b_add_loop_edges_ = true;
     }
 
     // Anchor among used nodes to remove gauge
     if (!used_nodes.empty()) {
         int anchor = (used_nodes.count(0) ? 0 : *used_nodes.begin());
+        problem.AddParameterBlock(layer->poses[anchor], 3);
         problem.SetParameterBlockConstant(layer->poses[anchor]);
     } else {
         // 추가된 제약이 없다면 바로 반환
@@ -1077,6 +1324,7 @@ void SimpleLayerManagerV2::optimize_local_window(const std::string& layer_id, in
     // Prefer node 0 if it is used; otherwise pick the smallest used node id.
     if (!used_nodes.empty()) {
         int anchor = (used_nodes.count(0) ? 0 : *used_nodes.begin());
+        problem.AddParameterBlock(layer->poses[anchor], 3);
         problem.SetParameterBlockConstant(layer->poses[anchor]);
     }
 
@@ -1111,17 +1359,28 @@ double SimpleLayerManagerV2::evaluate_layer_cost(const std::string& layer_id)
     std::vector<std::unique_ptr<double>> local_switches;
     local_switches.reserve(layer->inherited_edges.size() + layer->added_edges.size());
 
-    // Odometry constraints
-    for (auto* edge : g2o_.nEdgesOdometry) {
-        ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
-        problem.AddResidualBlock(cost, loss, 
-                               temp_poses[edge->a->index], 
-                               temp_poses[edge->b->index]);
-    }
-    
-    // Layer edges (inherited + added)
+    // Determine active nodes from layer edges up to k_lim
     auto all_edges = layer->get_all_edges();
     int k_lim = (online_active_k_ >= 0 ? online_active_k_ : std::numeric_limits<int>::max());
+    std::unordered_set<int> active_nodes;
+    for (auto* edge : all_edges) {
+        int ia = edge->a->index, ib = edge->b->index;
+        if (ia == ib) continue;
+        if (std::max(ia, ib) > k_lim) continue;
+        active_nodes.insert(ia);
+        active_nodes.insert(ib);
+    }
+
+    // Odometry constraints only between active nodes
+    for (auto* edge : g2o_.nEdgesOdometry) {
+        int ia = edge->a->index, ib = edge->b->index;
+        if (active_nodes.count(ia) && active_nodes.count(ib)) {
+            ceres::CostFunction* cost = OdometryResidue::Create(edge->x, edge->y, edge->theta);
+            problem.AddResidualBlock(cost, loss, temp_poses[ia], temp_poses[ib]);
+        }
+    }
+
+    // Layer edges (inherited + added)
     for (auto* edge : all_edges) {
         int ia = edge->a->index, ib = edge->b->index;
         if (ia == ib) continue;
@@ -1138,6 +1397,7 @@ double SimpleLayerManagerV2::evaluate_layer_cost(const std::string& layer_id)
         problem.AddResidualBlock(prior, nullptr, s_ptr);
     }
     
+    problem.AddParameterBlock(temp_poses[0], 3);
     problem.SetParameterBlockConstant(temp_poses[0]);
     ceres::Solver::Options options;
     options.max_num_iterations = 1;
@@ -1649,18 +1909,7 @@ void SimpleLayerManager2::run_online()
             b_add_loop_edges_ = false;
         }
 
-        // Short solve at each step
-        // ceres::Solver::Options opts;
-        // opts.max_num_iterations = std::max(1, config_.iters_per_step);
-        // opts.minimizer_progress_to_stdout = false;
-        // opts.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-        // opts.num_threads = std::thread::hardware_concurrency() != 0
-        //     ? std::thread::hardware_concurrency()
-        //     : 4;
-        // ceres::Solver::Summary sum;
-        // ceres::Solve(opts, &problem_, &sum);
-
-        if (config_.snapshot_every > 0 && (step % config_.snapshot_every == 0)) {
+        if (config_.snapshot_every > 0 && (step % 20 == 0)) {
             // Create snapshot dirs (PNG + data) compatible with METHOD 4 plotter
             std::filesystem::path snap_root = std::filesystem::path(save_path_) / "snapshots5";
             std::error_code ec;

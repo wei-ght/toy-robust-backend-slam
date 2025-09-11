@@ -15,6 +15,7 @@ set( SRC
   include/g2o_util.h              src/g2o_util.cpp
   include/graph.h                 src/graph.cpp
   include/simple_layer_manager.h  src/simple_layer_manager.cpp
+  include/simple_layer_manager6.h src/simple_layer_manager6.cpp
 )
 
 include_directories("${PROJECT_SOURCE_DIR}/include")
