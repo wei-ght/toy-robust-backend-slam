@@ -5,6 +5,7 @@
 #include <vector>
 #include <stdlib.h>     /* srand, rand */
 #include <time.h>       /* time */
+#include <chrono>       /* timing measurement */
 
 #include "ceres_error.h"
 #include "g2o_util.h"
@@ -59,6 +60,13 @@ static int run_online_baseline_dcs_sc(ReadG2O& g2o_manager, int METHOD)
         problem.AddParameterBlock(g2o_manager.nNodes[0]->p, 3);
         problem.SetParameterBlockConstant(g2o_manager.nNodes[0]->p);
     }
+    
+    // Optimization timing log file setup for method1/2
+    std::string method_name = (METHOD == 1) ? "method1_dcs" : (METHOD == 2) ? "method2_sc" : "method0_baseline";
+    std::string timing_log_path = SAVE_PATH + "/" + method_name + "_optimization_timing.txt";
+    std::ofstream timing_log(timing_log_path);
+    timing_log << "# k edge_type num_edges optimization_type duration_ms\n";
+    timing_log.flush();
 
     std::vector<double*> switch_variables; // for SC
     std::vector<double> switch_priors;
@@ -117,14 +125,58 @@ static int run_online_baseline_dcs_sc(ReadG2O& g2o_manager, int METHOD)
                   << ", bogus_added=" << added_bogus
                   << std::endl;
 
-        // short solve per step
-        ceres::Solver::Options options;
-        options.minimizer_progress_to_stdout = false;
-        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-        options.max_num_iterations = 2;
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
+        // Only optimize when loop closure or bogus edges are added
+        bool has_loop_edges = (added_closure > 0) || (added_bogus > 0);
+        if (has_loop_edges) {
+            std::cout << "[optimize] Loop edges detected, running optimization..." << std::endl;
+            
+            ceres::Solver::Options options;
+            options.max_num_iterations = std::max(1, 100);
+            options.minimizer_progress_to_stdout = false;
+            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+            options.num_threads = std::thread::hardware_concurrency() != 0
+                ? std::thread::hardware_concurrency()
+                : 4;
+            ceres::Solver::Summary summary;
+            
+            // Measure optimization time
+            auto start_time = std::chrono::high_resolution_clock::now();
+            ceres::Solve(options, &problem, &summary);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            
+            // Log timing data
+            std::ofstream timing_log(timing_log_path, std::ios::app);
+            timing_log << k << " loop_edges " << (added_closure + added_bogus) 
+                       << " loop_solve " << duration.count() << "\n";
+            timing_log.close();
+        } else {
+            std::cout << "[skip] Only odometry edges added, skipping optimization" << std::endl;
+        }
+            
     }
+
+    // Final optimization after all nodes are processed
+    std::cout << "[final] Running final optimization..." << std::endl;
+    ceres::Solver::Options final_options;
+    final_options.max_num_iterations = std::max(1, 200);
+    final_options.minimizer_progress_to_stdout = false;
+    final_options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    final_options.num_threads = std::thread::hardware_concurrency() != 0
+        ? std::thread::hardware_concurrency()
+        : 4;
+    ceres::Solver::Summary final_summary;
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
+    ceres::Solve(final_options, &problem, &final_summary);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    
+    // Log final optimization timing
+    std::ofstream final_timing_log(timing_log_path, std::ios::app);
+    final_timing_log << N-1 << " all " << (g2o_manager.nEdgesClosure.size() + g2o_manager.nEdgesBogus.size()) 
+                     << " final_solve " << duration.count() << "\n";
+    final_timing_log.close();
 
     // write outputs (poses and edges)
     g2o_manager.writePoseGraph_nodes(SAVE_PATH+"/opt_nodes.txt");
@@ -297,7 +349,23 @@ auto main(int argc, char *argv[]) ->int
     // options.dogleg_type = ceres::SUBSPACE_DOGLEG;
     // options.preconditioner_type = ceres::SCHUR_JACOBI;
     ceres::Solver::Summary summary;
+    
+    // Measure optimization time for offline mode
+    std::string method_name = (METHOD == 1) ? "method1_dcs" : (METHOD == 2) ? "method2_sc" : "method0_baseline";
+    std::string timing_log_path = SAVE_PATH + "/" + method_name + "_optimization_timing.txt";
+    std::ofstream timing_log(timing_log_path);
+    timing_log << "# k edge_type num_edges optimization_type duration_ms\n";
+    
+    int total_edges = g2o_manager.nEdgesOdometry.size() + g2o_manager.nEdgesClosure.size() + g2o_manager.nEdgesBogus.size();
+    auto start_time = std::chrono::high_resolution_clock::now();
     ceres::Solve(options, &problem, &summary);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    
+    timing_log << g2o_manager.nNodes.size()-1 << " all " << total_edges 
+               << " batch_solve " << duration.count() << "\n";
+    timing_log.close();
+    
     cout << summary.FullReport() << endl;
 
     // @ Write Pose Graph file after Optimization

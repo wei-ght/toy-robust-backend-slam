@@ -140,6 +140,12 @@ void SimpleLayerManagerV2::run_online()
 
     assignments_.clear();
     step_counter_ = 0;
+    
+    // Optimization timing log file setup
+    std::string timing_log_path = save_path_ + "/optimization_timing.txt";
+    std::ofstream timing_log(timing_log_path);
+    timing_log << "# step_counter k edge_a edge_b edge_type selected_layer optimization_type duration_ms\n";
+    timing_log.flush();
 
     // 누적 처리 카운터 (검증용)
     int total_processed_edges = 0;
@@ -1059,8 +1065,19 @@ void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& paren
     auto* parent_ptr = get_layer(parent_id);
     if (parent_ptr) parent_ptr->children.push_back(child_id);
 
-    // 2) 임시 레이어 전체 최적화
+    // 2) 임시 레이어 전체 최적화 (시간 측정)
+    auto start_time = std::chrono::high_resolution_clock::now();
     optimize_layer(child_id);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    
+    // Timing log (append mode)
+    std::string timing_log_path = save_path_ + "/optimization_timing.txt";
+    std::ofstream timing_log(timing_log_path, std::ios::app);
+    timing_log << step_counter_ << " " << online_active_k_ << " " 
+               << edge->a->index << " " << edge->b->index << " " << edge->edge_type << " "
+               << parent_id << " temp_layer " << duration.count() << "\n";
+    timing_log.close();
 
     // 3) Chi-squared 기반 엣지 필터링
     auto wrap = [](double a){ while(a > M_PI) a -= 2*M_PI; while(a < -M_PI) a += 2*M_PI; return a; };
@@ -1106,14 +1123,37 @@ void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& paren
     if (accept) {
         // 병합: 부모 포즈 갱신 + 엣지 추가 + 자식 삭제
         merge_child_into_parent_and_delete(parent_id, child_id, edge);
-        // Top-K 전파 및 best 최적화
+        // Top-K 전파 및 best 최적화 (시간 측정)
         if (config_.topk_layers > 0) {
             auto topk = get_topk_layers_by_reward(config_.topk_layers);
             std::string best_id = topk.empty() ? parent_id : topk[0];
             propagate_edge_to_layers(edge, topk, best_id, parent_id);
+            
+            auto start_time = std::chrono::high_resolution_clock::now();
             optimize_layer(best_id);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            
+            // Timing log
+            std::string timing_log_path = save_path_ + "/optimization_timing.txt";
+            std::ofstream timing_log(timing_log_path, std::ios::app);
+            timing_log << step_counter_ << " " << online_active_k_ << " " 
+                       << edge->a->index << " " << edge->b->index << " " << edge->edge_type << " "
+                       << best_id << " topk_best " << duration.count() << "\n";
+            timing_log.close();
         } else {
+            auto start_time = std::chrono::high_resolution_clock::now();
             optimize_layer(parent_id);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            
+            // Timing log
+            std::string timing_log_path = save_path_ + "/optimization_timing.txt";
+            std::ofstream timing_log(timing_log_path, std::ios::app);
+            timing_log << step_counter_ << " " << online_active_k_ << " " 
+                       << edge->a->index << " " << edge->b->index << " " << edge->edge_type << " "
+                       << parent_id << " parent " << duration.count() << "\n";
+            timing_log.close();
         }
         // 보상/백프로파게이션(부모 기준)
         double reward = calculate_reward(parent_id, edge);
@@ -1896,7 +1936,7 @@ void SimpleLayerManager2::run_online()
                  ", bogus_added=" + std::to_string(add_bg));
 
         if(b_add_loop_edges_) {
-            // Short solve at each step
+            // Short solve at each step (시간 측정)
             ceres::Solver::Options opts;
             opts.max_num_iterations = std::max(1, config_.iters_per_step);
             opts.minimizer_progress_to_stdout = false;
