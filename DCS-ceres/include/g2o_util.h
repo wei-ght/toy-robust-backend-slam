@@ -72,7 +72,7 @@ public:
                 I23 = boost::lexical_cast<double>( words[10] );
                 I33 = boost::lexical_cast<double>( words[11] );
 
-                if( abs(a_indx - b_indx) < 5 )
+                if( abs(a_indx - b_indx) <= 1 )
                 {
                   double final_dx = dx, final_dy = dy, final_dtheta = dtheta_orig;
                   int final_a_indx = a_indx, final_b_indx = b_indx;

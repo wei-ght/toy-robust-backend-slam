@@ -22,8 +22,8 @@ def load_method_timing_data(data_dir):
     for method_num in [0, 1, 2]:
         method_names = {
             0: "method0_baseline",
-            1: "method1_dcs", 
-            2: "method2_sc"
+            1: "DCS", 
+            2: "SC"
         }
         timing_file = data_dir / f"{method_names[method_num]}_optimization_timing.txt"
         
@@ -43,8 +43,8 @@ def load_method_timing_data(data_dir):
             df = pd.read_csv(method4_file, sep=' ', comment='#',
                            names=['step_counter', 'k', 'edge_a', 'edge_b', 'edge_type', 
                                  'selected_layer', 'optimization_type', 'duration_ms'])
-            method_data['method4_layer_mcts'] = df
-            print(f"Loaded {len(df)} records from method4_layer_mcts")
+            method_data['MCTS'] = df
+            print(f"Loaded {len(df)} records from MCTS")
         except Exception as e:
             print(f"Error loading {method4_file}: {e}")
     
@@ -70,15 +70,15 @@ def plot_unified_timing_analysis(data_dir, output_dir=None):
     # Define colors for each method
     colors = {
         'method0_baseline': '#1f77b4',
-        'method1_dcs': '#ff7f0e', 
-        'method2_sc': '#2ca02c',
-        'method4_layer_mcts': '#d62728'
+        'DCS': '#ff7f0e', 
+        'SC': '#2ca02c',
+        'MCTS': '#d62728'
     }
     
     # 1. Time series by k (node index)
     ax1 = axes[0, 0]
     for method_name, df in method_data.items():
-        if method_name == 'method4_layer_mcts':
+        if method_name == 'MCTS':
             # For method4, group by k and calculate mean duration
             k_stats = df.groupby('k')['duration_ms'].mean()
             ax1.plot(k_stats.index, k_stats.values, 'o-', 
@@ -147,8 +147,8 @@ def plot_unified_timing_analysis(data_dir, output_dir=None):
     
     # 4. Method4 specific analysis (optimization types)
     ax4 = axes[1, 0]
-    if 'method4_layer_mcts' in method_data:
-        df_m4 = method_data['method4_layer_mcts']
+    if 'MCTS' in method_data:
+        df_m4 = method_data['MCTS']
         opt_types = df_m4['optimization_type'].unique()
         
         for opt_type in opt_types:
@@ -172,7 +172,7 @@ def plot_unified_timing_analysis(data_dir, output_dir=None):
     ax5 = axes[1, 1]
     for method_name, df in method_data.items():
         if len(df) > 0:
-            if method_name == 'method4_layer_mcts':
+            if method_name == 'MCTS':
                 # For method4, sort by step_counter and calculate cumulative
                 df_sorted = df.sort_values('step_counter')
                 cumulative_time = df_sorted['duration_ms'].cumsum()
@@ -247,7 +247,7 @@ def plot_unified_timing_analysis(data_dir, output_dir=None):
             print(f"  Max:        {df['duration_ms'].max():.2f} ms")
             print(f"  Total:      {df['duration_ms'].sum():.0f} ms")
             
-            if method_name == 'method4_layer_mcts':
+            if method_name == 'MCTS':
                 print(f"  Optimization types:")
                 for opt_type in df['optimization_type'].unique():
                     count = len(df[df['optimization_type'] == opt_type])

@@ -15,21 +15,51 @@ class G2OVisualizer:
         self.odometry_edges = []  # [(from_idx, to_idx, dx, dy, dtheta)]
         self.closure_edges = []   # [(from_idx, to_idx, dx, dy, dtheta)]
         self.bogus_edges = []     # [(from_idx, to_idx, dx, dy, dtheta)]
+        self.scans = {}           # index -> Nx2 array (points in node frame)
         
     def parse_g2o(self, filename):
         """Parse g2o format file"""
         print(f"Reading g2o file: {filename}")
-        
+        last_node_id = None
+        pending_pts_expected = None
+        pending_pts_vals = []
+
         with open(filename, 'r') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
-                if not line or line.startswith('#'):
+                if not line:
                     continue
-                    
+                # parse optional scan comment blocks
+                if line.startswith('#'):
+                    parts = line[1:].strip().split()
+                    if len(parts) >= 2 and parts[0] == 'POINTS_COUNT':
+                        try:
+                            pending_pts_expected = int(parts[1])
+                            pending_pts_vals = []
+                        except ValueError:
+                            print(f"Warning: invalid POINTS_COUNT at line {line_num}")
+                    elif len(parts) >= 2 and parts[0] == 'POINTS_DATA':
+                        # append floats in this line
+                        try:
+                            floats = list(map(float, parts[1:]))
+                            pending_pts_vals.extend(floats)
+                        except ValueError:
+                            print(f"Warning: invalid POINTS_DATA at line {line_num}")
+                        # if enough values are gathered, store to current vertex
+                        if pending_pts_expected is not None and last_node_id is not None:
+                            needed = pending_pts_expected * 2
+                            if len(pending_pts_vals) >= needed:
+                                arr = np.array(pending_pts_vals[:needed], dtype=float).reshape(-1, 2)
+                                self.scans[last_node_id] = arr
+                                pending_pts_expected = None
+                                pending_pts_vals = []
+                    # move to next line
+                    continue
+                
                 parts = line.split()
                 if not parts:
                     continue
-                    
+                
                 try:
                     if parts[0] in ['VERTEX_SE2', 'VERTEX2']:
                         # Parse vertex: VERTEX_SE2 id x y theta
@@ -38,6 +68,7 @@ class G2OVisualizer:
                         y = float(parts[3])
                         theta = float(parts[4])
                         self.nodes[node_id] = (x, y, theta)
+                        last_node_id = node_id
                         
                     elif parts[0] in ['EDGE_SE2', 'EDGE2']:
                         # Parse edge: EDGE_SE2 id1 id2 dx dy dtheta info(6)
@@ -59,9 +90,12 @@ class G2OVisualizer:
                     continue
         
         print(f"Loaded {len(self.nodes)} nodes, {len(self.odometry_edges)} odometry edges, {len(self.closure_edges)} closure edges")
+        if self.scans:
+            print(f"Loaded scan data for {len(self.scans)} nodes")
         
     def plot_pose_graph(self, show_odometry=True, show_closures=True, show_nodes=True, 
-                       node_size=20, edge_alpha=0.6, figsize=(12, 10)):
+                       node_size=20, edge_alpha=0.6, figsize=(12, 10),
+                       show_scans=False, scan_alpha=0.3, scan_size=1.0):
         """Plot the pose graph"""
         
         if not self.nodes:
@@ -127,6 +161,26 @@ class G2OVisualizer:
                  f'Closures: {len(self.closure_edges)}')
         plt.xlabel('X (m)')
         plt.ylabel('Y (m)')
+        
+        # Plot scan points, transformed to world frame
+        if show_scans and self.scans:
+            xs_all = []
+            ys_all = []
+            for nid, pts in self.scans.items():
+                if nid not in self.nodes:
+                    continue
+                x, y, th = self.nodes[nid]
+                c = math.cos(th)
+                s = math.sin(th)
+                # node->world transform
+                wx = c * pts[:, 0] - s * pts[:, 1] + x
+                wy = s * pts[:, 0] + c * pts[:, 1] + y
+                xs_all.append(wx)
+                ys_all.append(wy)
+            if xs_all:
+                xs_cat = np.concatenate(xs_all)
+                ys_cat = np.concatenate(ys_all)
+                plt.scatter(xs_cat, ys_cat, s=scan_size, c='gray', alpha=scan_alpha, linewidths=0)
         plt.axis('equal')
         plt.grid(True, alpha=0.3)
         plt.legend()
@@ -198,6 +252,7 @@ def main():
     parser = argparse.ArgumentParser(description='Visualize G2O pose graph files')
     parser.add_argument('g2o_file', help='Path to g2o file')
     parser.add_argument('--output', help='Output image file (optional)')
+    parser.add_argument('--opt-poses', help='Optional optimized poses file (index x y theta) to override g2o nodes')
     parser.add_argument('--no-show', action='store_true', help='Don\'t display plots')
     parser.add_argument('--stats', action='store_true', help='Show edge statistics')
     parser.add_argument('--hide-odometry', action='store_true', help='Hide odometry edges')
@@ -206,6 +261,9 @@ def main():
     parser.add_argument('--node-size', type=int, default=20, help='Node size for plotting')
     parser.add_argument('--edge-alpha', type=float, default=0.6, help='Edge transparency')
     parser.add_argument('--figsize', nargs=2, type=int, default=[12, 10], help='Figure size [width height]')
+    parser.add_argument('--scan', action='store_true', help='Overlay raw scan points if present in g2o comments')
+    parser.add_argument('--scan-alpha', type=float, default=0.3, help='Alpha for scan points')
+    parser.add_argument('--scan-size', type=float, default=1.0, help='Marker size for scan points')
     
     args = parser.parse_args()
     
@@ -216,6 +274,32 @@ def main():
     # Create visualizer and parse file
     viz = G2OVisualizer()
     viz.parse_g2o(args.g2o_file)
+
+    # Optionally override node poses with optimized ones
+    if args.opt_poses and os.path.exists(args.opt_poses):
+        try:
+            with open(args.opt_poses, 'r') as fp:
+                cnt = 0
+                for line in fp:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        nid = int(parts[0])
+                        x = float(parts[1])
+                        y = float(parts[2])
+                        th = float(parts[3])
+                        if nid in viz.nodes:
+                            viz.nodes[nid] = (x, y, th)
+                            cnt += 1
+                    except ValueError:
+                        continue
+            print(f"Overrode {cnt} node poses from optimized file: {args.opt_poses}")
+        except Exception as e:
+            print(f"Warning: failed to load opt poses {args.opt_poses}: {e}")
     
     # Plot main graph
     fig1 = viz.plot_pose_graph(
@@ -224,7 +308,10 @@ def main():
         show_nodes=not args.hide_nodes,
         node_size=args.node_size,
         edge_alpha=args.edge_alpha,
-        figsize=tuple(args.figsize)
+        figsize=tuple(args.figsize),
+        show_scans=args.scan,
+        scan_alpha=args.scan_alpha,
+        scan_size=args.scan_size
     )
     
     if args.output:
