@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <iterator>
 
 using std::vector;
 using std::pair;
@@ -81,11 +82,16 @@ void SimpleLayerManagerV2::run()
 {
     log_line("[run] Starting METHOD 4 with " + std::to_string(candidate_edges_.size()) + " edges");
     
+    // Initialize method statistics tracking
+    method_start_time_ = std::chrono::high_resolution_clock::now();
+    
     assignments_.reserve(candidate_edges_.size());
     
     for (int i = 0; i < static_cast<int>(candidate_edges_.size()); ++i) {
         step_counter_++;
         Edge* edge = candidate_edges_[i];
+        
+        auto step_start_time = std::chrono::high_resolution_clock::now();
         
         log_line("[step " + std::to_string(step_counter_) + "] Processing edge (" + 
                  std::to_string(edge->a->index) + "," + std::to_string(edge->b->index) + 
@@ -120,7 +126,38 @@ void SimpleLayerManagerV2::run()
         // }
         
         // 임시 레이어 개선 기반 파이프라인 적용 (Top-K는 병합 시 수행)
-        process_edge_with_temp_layer(selected_layer, edge);
+        double optimization_time = process_edge_with_temp_layer(selected_layer, edge);
+        
+        // Current maximum node index processed (based on edge nodes)
+        int max_node_idx = std::max(edge->a->index, edge->b->index);
+        double cum_distance = calculate_cumulative_distance_up_to_node(max_node_idx);
+        int current_layer_count = static_cast<int>(layers_.size());
+        
+        // Adjust node count for closure/bogus edges (they don't add new nodes)
+        int adjusted_node_count = max_node_idx + 1;
+        if (edge->edge_type == CLOSURE_EDGE || edge->edge_type == BOGUS_EDGE) {
+            // For closure/bogus edges, the node count should reflect actual unique nodes
+            // Count closure/bogus edges processed so far in this step
+            int closure_bogus_count = 0;
+            for (int j = 0; j <= i; ++j) {
+                Edge* prev_edge = candidate_edges_[j];
+                if (prev_edge->edge_type == CLOSURE_EDGE || prev_edge->edge_type == BOGUS_EDGE) {
+                    if (std::max(prev_edge->a->index, prev_edge->b->index) <= max_node_idx) {
+                        closure_bogus_count++;
+                    }
+                }
+            }
+            // Subtract closure/bogus edges as they don't contribute new nodes
+            adjusted_node_count = std::max(1, max_node_idx + 1 - closure_bogus_count);
+            
+            log_line("[stats] closure/bogus edge detected, adjusted node count: " + 
+                     std::to_string(max_node_idx + 1) + " -> " + std::to_string(adjusted_node_count));
+        }
+        
+        // Track statistics for DCS method (METHOD 4 is DCS-based)
+        track_method_statistics("DCS", step_counter_, adjusted_node_count, cum_distance, 
+                               current_layer_count, optimization_time);
+        
         // 스냅샷 저장 (요청 시)
         if (config_.snapshot_every > 0 && (step_counter_ % config_.snapshot_every == 0)) {
             save_snapshot(step_counter_);
@@ -131,6 +168,11 @@ void SimpleLayerManagerV2::run()
     if (config_.snapshot_every > 0) {
         save_snapshot(step_counter_);
     }
+    
+    // Output and save statistics
+    output_method_statistics();
+    save_statistics_to_file(save_path_ + "/method_statistics.txt");
+    
     log_line("[run] METHOD 4 completed");
 }
 
@@ -140,6 +182,9 @@ void SimpleLayerManagerV2::run_online()
 
     assignments_.clear();
     step_counter_ = 0;
+    
+    // Initialize method statistics tracking for online mode
+    method_start_time_ = std::chrono::high_resolution_clock::now();
     
     // Optimization timing log file setup
     std::string timing_log_path = save_path_ + "/optimization_timing.txt";
@@ -155,6 +200,8 @@ void SimpleLayerManagerV2::run_online()
     int N = static_cast<int>(g2o_.nNodes.size());
     for (int k = 1; k < N; ++k) {
         online_active_k_ = k;
+        step_counter_++;
+
         // 수집: 새 노드 k와 관련된 루프/보거스 에지들만 처리
         std::vector<Edge*> new_edges;
         new_edges.reserve(32);
@@ -181,7 +228,7 @@ void SimpleLayerManagerV2::run_online()
         if (new_edges.empty()) continue;
 
         for (auto* edge : new_edges) {
-            step_counter_++;
+            
             log_line("[online step " + std::to_string(step_counter_) + "] edge (" +
                      std::to_string(edge->a->index) + "," + std::to_string(edge->b->index) + ") type=" + std::to_string(edge->edge_type));
 
@@ -226,9 +273,29 @@ void SimpleLayerManagerV2::run_online()
                 log_line("[skip] edge not selected by probabilistic filtering");
                 continue;
             }
-
+            
             // 임시 레이어 개선 기반 파이프라인 적용 (Top-K는 병합 시 수행)
-            process_edge_with_temp_layer(selected_layer, edge);
+            double optimization_time = process_edge_with_temp_layer(selected_layer, edge);
+            
+            // In online mode, track statistics based on current active node k
+            double cum_distance = calculate_cumulative_distance_up_to_node(k);
+            int current_layer_count = static_cast<int>(layers_.size());
+            
+            // Adjust node count for closure/bogus edges in online mode
+            int adjusted_node_count = k + 1;
+            if (edge->edge_type == CLOSURE_EDGE || edge->edge_type == BOGUS_EDGE) {
+                // In online mode, closure/bogus edges don't add new nodes
+                // The node count should reflect the actual maximum node index processed
+                adjusted_node_count = k;  // Don't count the closure edge as adding a new node
+                
+                log_line("[stats] online closure/bogus edge detected, adjusted node count: " + 
+                         std::to_string(k + 1) + " -> " + std::to_string(adjusted_node_count));
+            }
+            
+            // Track statistics for DCS method in online mode
+            track_method_statistics("DCS_Online", step_counter_, adjusted_node_count, cum_distance, 
+                                   current_layer_count, optimization_time);
+            
             // 스냅샷 저장 (요청 시)
             if (config_.snapshot_every > 0 && (step_counter_ % config_.snapshot_every == 0)) {
                 save_snapshot(step_counter_);
@@ -262,6 +329,11 @@ void SimpleLayerManagerV2::run_online()
     if (config_.snapshot_every > 0) {
         save_snapshot(step_counter_);
     }
+    
+    // Output and save statistics for online mode
+    output_method_statistics();
+    save_statistics_to_file(save_path_ + "/method_statistics_online.txt");
+    
     log_line("[run-online] METHOD 4 ONLINE completed");
 }
 
@@ -636,6 +708,7 @@ double SimpleLayerManagerV2::calculate_info_gain(Edge* edge)
     // 고유값 분해
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(Omega);
     Eigen::Vector3d eigenvalues = solver.eigenvalues().cwiseMax(1e-12);
+    //eigenvalue normalization
     
     // logdet(I + Omega) = sum(log(1 + lambda_i))
     double logdet = 0.0;
@@ -1055,10 +1128,10 @@ void SimpleLayerManagerV2::merge_child_into_parent_and_delete(const std::string&
     log_line("[merge] merged child " + child_id + " into parent " + parent_id + " and deleted child");
 }
 
-void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& parent_id, Edge* edge)
+double SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& parent_id, Edge* edge)
 {
     auto* parent = get_layer(parent_id);
-    if (!parent || !edge) return;
+    if (!parent || !edge) return 0.0;
 
     // 1) 임시 레이어 생성 (엣지 포함)
     std::string child_id = create_child_layer(parent_id, edge, true);
@@ -1070,6 +1143,7 @@ void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& paren
     optimize_layer(child_id);
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    double total_optimization_time = duration.count();
     
     // Timing log (append mode)
     std::string timing_log_path = save_path_ + "/optimization_timing.txt";
@@ -1102,21 +1176,53 @@ void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& paren
 
     // 새 엣지의 chi2 값만 확인 (최적화된 자식 레이어에서)
     auto* child = get_layer(child_id);
-    if (!child) return;
+    if (!child) return total_optimization_time;
     
     int ia = edge->a->index, ib = edge->b->index;
-    if (ia < 0 || ib < 0 || ia >= (int)child->poses.size() || ib >= (int)child->poses.size()) return;
+    if (ia < 0 || ib < 0 || ia >= (int)child->poses.size() || ib >= (int)child->poses.size()) return total_optimization_time;
     
     double new_edge_chi2 = edge_chi2(child->poses[ia], child->poses[ib], edge);
+    
+    // Calculate Euclidean distance between nodes (after optimization)
+    double* pose_a = child->poses[ia];
+    double* pose_b = child->poses[ib];
+    double euclidean_dist = std::sqrt(
+        (pose_a[0] - pose_b[0]) * (pose_a[0] - pose_b[0]) + 
+        (pose_a[1] - pose_b[1]) * (pose_a[1] - pose_b[1])
+    );
+    
+    // Angular distance (absolute difference in orientation)
+    auto wrap_angle = [](double a) { while(a > M_PI) a -= 2*M_PI; while(a < -M_PI) a += 2*M_PI; return a; };
+    double angular_dist = std::abs(wrap_angle(pose_a[2] - pose_b[2]));
     
     // Chi-squared threshold for 3 DOF (95% confidence: 7.815, 99% confidence: 11.345)
     const double chi2_threshold_95 = 7.815;  // TODO: expose via config
     const double chi2_threshold_99 = 11.345; // TODO: expose via config
     const double chi2_threshold = chi2_threshold_95; // Use 95% confidence by default
     
+        
+    // Statistical thresholds for node proximity (based on typical SLAM uncertainty)
+    const double close_euclidean_threshold = 1.5;    // 1.5m - typical GPS/odometry accuracy
+    const double close_angular_threshold = 5.0 * M_PI / 180.0; // 5 degrees - typical orientation uncertainty
+    const double very_close_euclidean_threshold = 0.1; // 0.1m - very close nodes
+    const double very_close_angular_threshold = 2.0 * M_PI / 180.0; // 2 degrees - very close orientation
+    
+    // Determine proximity level
+    std::string proximity_level = "far";
+    if (euclidean_dist <= very_close_euclidean_threshold && angular_dist <= very_close_angular_threshold) {
+        proximity_level = "very_close";
+    } else if (euclidean_dist <= close_euclidean_threshold && angular_dist <= close_angular_threshold) {
+        proximity_level = "close";
+    }
+    
+
+
     log_line(std::string("[chi2-filter] new_edge_chi2=") + std::to_string(new_edge_chi2) +
              ", threshold=" + std::to_string(chi2_threshold) +
-             ", edge=(" + std::to_string(ia) + "," + std::to_string(ib) + ")");
+             ", edge=(" + std::to_string(ia) + "," + std::to_string(ib) + ")" +
+             ", euclidean_dist=" + std::to_string(euclidean_dist) + "m" +
+             ", angular_dist=" + std::to_string(angular_dist * 180.0 / M_PI) + "deg" +
+             ", proximity=" + proximity_level);
 
     bool accept = (new_edge_chi2 < chi2_threshold);
 
@@ -1132,27 +1238,29 @@ void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& paren
             auto start_time = std::chrono::high_resolution_clock::now();
             optimize_layer(best_id);
             auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            auto additional_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            total_optimization_time += additional_duration.count();
             
             // Timing log
             std::string timing_log_path = save_path_ + "/optimization_timing.txt";
             std::ofstream timing_log(timing_log_path, std::ios::app);
             timing_log << step_counter_ << " " << online_active_k_ << " " 
                        << edge->a->index << " " << edge->b->index << " " << edge->edge_type << " "
-                       << best_id << " topk_best " << duration.count() << "\n";
+                       << best_id << " topk_best " << additional_duration.count() << "\n";
             timing_log.close();
         } else {
             auto start_time = std::chrono::high_resolution_clock::now();
             optimize_layer(parent_id);
             auto end_time = std::chrono::high_resolution_clock::now();
-            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            auto additional_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            total_optimization_time += additional_duration.count();
             
             // Timing log
             std::string timing_log_path = save_path_ + "/optimization_timing.txt";
             std::ofstream timing_log(timing_log_path, std::ios::app);
             timing_log << step_counter_ << " " << online_active_k_ << " " 
                        << edge->a->index << " " << edge->b->index << " " << edge->edge_type << " "
-                       << parent_id << " parent " << duration.count() << "\n";
+                       << parent_id << " parent " << additional_duration.count() << "\n";
             timing_log.close();
         }
         // 보상/백프로파게이션(부모 기준)
@@ -1166,6 +1274,8 @@ void SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& paren
         double reward = calculate_reward(child_id, edge);
         backpropagate(child_id, reward);
     }
+    
+    return total_optimization_time;
 }
 
 bool SimpleLayerManagerV2::should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual)
@@ -1842,6 +1952,10 @@ void SimpleLayerManager2::run_online()
 {
     const int N = static_cast<int>(g2o_.nNodes.size());
     if (N == 0) return;
+    
+    // Initialize method statistics tracking for SC method
+    method_start_time_ = std::chrono::high_resolution_clock::now();
+    int step_counter = 0;
 
     // Explicitly add and fix anchor node 0
     if (!anchor_added_) {
@@ -1888,6 +2002,9 @@ void SimpleLayerManager2::run_online()
     int step = 0;
     for (int k = 1; k < N; ++k) {
         step++;
+        step_counter++;
+        auto step_start_time = std::chrono::high_resolution_clock::now();
+        
         int add_odo = 0, add_cl = 0, add_bg = 0;
 
         // Add odometry edges that become active at k
@@ -1935,6 +2052,7 @@ void SimpleLayerManager2::run_online()
                  ", closure_added=" + std::to_string(add_cl) +
                  ", bogus_added=" + std::to_string(add_bg));
 
+        double optimization_time = 0.0;
         if(b_add_loop_edges_) {
             // Short solve at each step (시간 측정)
             ceres::Solver::Options opts;
@@ -1945,7 +2063,13 @@ void SimpleLayerManager2::run_online()
                 ? std::thread::hardware_concurrency()
                 : 4;
             ceres::Solver::Summary sum;
+            
+            auto opt_start_time = std::chrono::high_resolution_clock::now();
             ceres::Solve(opts, &problem_, &sum);
+            auto opt_end_time = std::chrono::high_resolution_clock::now();
+            auto opt_duration = std::chrono::duration_cast<std::chrono::milliseconds>(opt_end_time - opt_start_time);
+            optimization_time = opt_duration.count();
+            
             b_add_loop_edges_ = false;
         }
 
@@ -2009,6 +2133,13 @@ void SimpleLayerManager2::run_online()
                               " --no-show > /dev/null 2>&1";
             std::system(cmd.c_str());
         }
+        
+        // Track statistics for SC (Switchable Constraints) method
+        double cum_distance = calculate_cumulative_distance_up_to_node(k);
+        int layer_count = 1; // METHOD 5 uses single global problem, so always 1 layer
+        
+        track_method_statistics("SC", step_counter, k + 1, cum_distance, 
+                               layer_count, optimization_time);
     }
     ceres::Solver::Options opts;
     opts.max_num_iterations = std::max(1, 100);
@@ -2023,6 +2154,10 @@ void SimpleLayerManager2::run_online()
     // Save final results
     save_nodes(save_path_ + "/opt_nodes.txt");
     save_switches(save_path_ + "/switches.txt");
+    
+    // Output and save statistics for SC method
+    output_method_statistics();
+    save_statistics_to_file(save_path_ + "/method_statistics_sc.txt");
 }
 
 void SimpleLayerManager2::log_line(const std::string& s)
@@ -2204,4 +2339,203 @@ double SimpleLayerManager2::calculate_reward(int k, Edge* added_edge)
     double reward = -dcost_rel + config_.alpha_info * info_gain - config_.beta_sparse * (double)n_active;
     if (reward > 1.0) reward = 1.0; if (reward < -1.0) reward = -1.0;
     return reward;
+}
+
+// Statistics tracking implementation for SimpleLayerManager2 (METHOD 5)
+void SimpleLayerManager2::track_method_statistics(const std::string& method_name, int time_step, int node_count, 
+                                                 double cumulative_distance, int layer_count, double processing_time)
+{
+    if (method_statistics_.find(method_name) == method_statistics_.end()) {
+        method_statistics_[method_name] = MethodStats{method_name, {}, {}, {}, {}, {}};
+    }
+    
+    auto& stats = method_statistics_[method_name];
+    stats.time_steps.push_back(time_step);
+    stats.node_counts.push_back(node_count);
+    stats.cumulative_distances.push_back(cumulative_distance);
+    stats.layer_counts.push_back(layer_count);
+    stats.processing_times.push_back(processing_time);
+    
+    log_line("[stats] " + method_name + " - step=" + std::to_string(time_step) + 
+             ", nodes=" + std::to_string(node_count) + 
+             ", cum_dist=" + std::to_string(cumulative_distance) + "m" +
+             ", layers=" + std::to_string(layer_count) + 
+             ", time=" + std::to_string(processing_time) + "ms");
+}
+
+double SimpleLayerManager2::calculate_cumulative_distance_up_to_node(int node_idx)
+{
+    double total_distance = 0.0;
+    
+    // Calculate cumulative distance from odometry edges up to node_idx
+    for (auto* edge : g2o_.nEdgesOdometry) {
+        int max_node = std::max(edge->a->index, edge->b->index);
+        if (max_node <= node_idx) {
+            // Calculate Euclidean distance from odometry measurement
+            double dx = edge->x;
+            double dy = edge->y;
+            double distance = std::sqrt(dx*dx + dy*dy);
+            total_distance += distance;
+        }
+    }
+    
+    return total_distance;
+}
+
+void SimpleLayerManager2::output_method_statistics()
+{
+    log_line("\n=== METHOD STATISTICS SUMMARY ===");
+    
+    for (const auto& pair : method_statistics_) {
+        const auto& method_name = pair.first;
+        const auto& stats = pair.second;
+        
+        if (stats.time_steps.empty()) continue;
+        
+        log_line("\n--- " + method_name + " STATISTICS ---");
+        log_line("Total steps processed: " + std::to_string(stats.time_steps.size()));
+        log_line("Final node count: " + std::to_string(stats.node_counts.back()));
+        log_line("Final cumulative distance: " + std::to_string(stats.cumulative_distances.back()) + "m");
+        log_line("Final layer count: " + std::to_string(stats.layer_counts.back()));
+        
+        // Calculate average processing time
+        double total_time = std::accumulate(stats.processing_times.begin(), stats.processing_times.end(), 0.0);
+        double avg_time = total_time / stats.processing_times.size();
+        log_line("Average processing time per step: " + std::to_string(avg_time) + "ms");
+        log_line("Total processing time: " + std::to_string(total_time) + "ms");
+    }
+}
+
+void SimpleLayerManager2::save_statistics_to_file(const std::string& filename)
+{
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        log_line("[error] Failed to open statistics file: " + filename);
+        return;
+    }
+    
+    file << "# Method Statistics Data\n";
+    file << "# Format: method_name,time_step,node_count,cumulative_distance,layer_count,processing_time_ms\n";
+    
+    for (const auto& pair : method_statistics_) {
+        const auto& method_name = pair.first;
+        const auto& stats = pair.second;
+        
+        for (size_t i = 0; i < stats.time_steps.size(); ++i) {
+            file << method_name << ","
+                 << stats.time_steps[i] << ","
+                 << stats.node_counts[i] << ","
+                 << std::fixed << std::setprecision(6) << stats.cumulative_distances[i] << ","
+                 << stats.layer_counts[i] << ","
+                 << std::fixed << std::setprecision(3) << stats.processing_times[i] << "\n";
+        }
+    }
+    
+    file.close();
+    log_line("[stats] Statistics saved to: " + filename);
+}
+
+// Statistics tracking implementation
+void SimpleLayerManagerV2::track_method_statistics(const std::string& method_name, int time_step, int node_count, 
+                                                   double cumulative_distance, int layer_count, double processing_time)
+{
+    if (method_statistics_.find(method_name) == method_statistics_.end()) {
+        method_statistics_[method_name] = MethodStats{method_name, {}, {}, {}, {}, {}};
+    }
+    
+    auto& stats = method_statistics_[method_name];
+    stats.time_steps.push_back(time_step);
+    stats.node_counts.push_back(node_count);
+    stats.cumulative_distances.push_back(cumulative_distance);
+    stats.layer_counts.push_back(layer_count);
+    stats.processing_times.push_back(processing_time);
+    
+    log_line("[stats] " + method_name + " - step=" + std::to_string(time_step) + 
+             ", nodes=" + std::to_string(node_count) + 
+             ", cum_dist=" + std::to_string(cumulative_distance) + "m" +
+             ", layers=" + std::to_string(layer_count) + 
+             ", time=" + std::to_string(processing_time) + "ms");
+}
+
+double SimpleLayerManagerV2::calculate_cumulative_distance_up_to_node(int node_idx)
+{
+    double total_distance = 0.0;
+    
+    // Calculate cumulative distance from odometry edges up to node_idx
+    for (auto* edge : g2o_.nEdgesOdometry) {
+        int max_node = std::max(edge->a->index, edge->b->index);
+        if (max_node <= node_idx) {
+            // Calculate Euclidean distance from odometry measurement
+            double dx = edge->x;
+            double dy = edge->y;
+            double distance = std::sqrt(dx*dx + dy*dy);
+            total_distance += distance;
+        }
+    }
+    
+    return total_distance;
+}
+
+void SimpleLayerManagerV2::output_method_statistics()
+{
+    log_line("\n=== METHOD STATISTICS SUMMARY ===");
+    
+    for (const auto& pair : method_statistics_) {
+        const auto& method_name = pair.first;
+        const auto& stats = pair.second;
+        
+        if (stats.time_steps.empty()) continue;
+        
+        log_line("\n--- " + method_name + " ---");
+        log_line("Total time steps: " + std::to_string(stats.time_steps.size()));
+        log_line("Final node count: " + std::to_string(stats.node_counts.back()));
+        log_line("Final cumulative distance: " + std::to_string(stats.cumulative_distances.back()) + " m");
+        log_line("Final layer count: " + std::to_string(stats.layer_counts.back()));
+        
+        // Calculate average processing time
+        double avg_time = 0.0;
+        for (double t : stats.processing_times) avg_time += t;
+        avg_time /= stats.processing_times.size();
+        log_line("Average processing time: " + std::to_string(avg_time) + " ms");
+        
+        // Show some detailed entries
+        log_line("Sample entries:");
+        int sample_interval = std::max(1, (int)stats.time_steps.size() / 10);
+        for (size_t i = 0; i < stats.time_steps.size(); i += sample_interval) {
+            log_line("  Step " + std::to_string(stats.time_steps[i]) + 
+                     ": nodes=" + std::to_string(stats.node_counts[i]) + 
+                     ", dist=" + std::to_string(stats.cumulative_distances[i]) + "m" +
+                     ", layers=" + std::to_string(stats.layer_counts[i]));
+        }
+    }
+}
+
+void SimpleLayerManagerV2::save_statistics_to_file(const std::string& filename)
+{
+    std::ofstream file(save_path_ + "/" + filename);
+    if (!file.is_open()) {
+        log_line("[error] Could not open statistics file: " + filename);
+        return;
+    }
+    
+    // Write header
+    file << "# Method Statistics\n";
+    file << "# Format: method_name,time_step,node_count,cumulative_distance_m,layer_count,processing_time_ms\n";
+    
+    for (const auto& pair : method_statistics_) {
+        const auto& method_name = pair.first;
+        const auto& stats = pair.second;
+        
+        for (size_t i = 0; i < stats.time_steps.size(); ++i) {
+            file << method_name << ","
+                 << stats.time_steps[i] << ","
+                 << stats.node_counts[i] << ","
+                 << stats.cumulative_distances[i] << ","
+                 << stats.layer_counts[i] << ","
+                 << stats.processing_times[i] << "\n";
+        }
+    }
+    
+    file.close();
+    log_line("[stats] Statistics saved to " + filename);
 }

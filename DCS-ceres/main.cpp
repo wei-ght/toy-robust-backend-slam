@@ -6,6 +6,7 @@
 #include <stdlib.h>     /* srand, rand */
 #include <time.h>       /* time */
 #include <chrono>       /* timing measurement */
+#include <iomanip>      /* setprecision, fixed */
 
 #include "ceres_error.h"
 #include "g2o_util.h"
@@ -61,12 +62,39 @@ static int run_online_baseline_dcs_sc(ReadG2O& g2o_manager, int METHOD)
         problem.SetParameterBlockConstant(g2o_manager.nNodes[0]->p);
     }
     
+    // Statistics tracking structure
+    struct MethodStats {
+        std::string method_name;
+        std::vector<int> time_steps;
+        std::vector<int> node_counts;
+        std::vector<double> cumulative_distances;
+        std::vector<int> layer_counts;
+        std::vector<double> processing_times;
+    };
+    
     // Optimization timing log file setup for method1/2
     std::string method_name = (METHOD == 1) ? "method1_dcs" : (METHOD == 2) ? "method2_sc" : "method0_baseline";
     std::string timing_log_path = SAVE_PATH + "/" + method_name + "_optimization_timing.txt";
     std::ofstream timing_log(timing_log_path);
     timing_log << "# k edge_type num_edges optimization_type duration_ms\n";
     timing_log.flush();
+    
+    // Statistics tracking
+    MethodStats stats;
+    stats.method_name = method_name;
+    
+    // Function to calculate cumulative distance
+    auto calculate_cumulative_distance = [&](int node_idx) -> double {
+        double total = 0.0;
+        for (auto* edge : g2o_manager.nEdgesOdometry) {
+            int ia = edge->a->index, ib = edge->b->index;
+            if (std::max(ia, ib) <= node_idx) {
+                double dx = edge->x, dy = edge->y;
+                total += std::sqrt(dx*dx + dy*dy);
+            }
+        }
+        return total;
+    };
 
     std::vector<double*> switch_variables; // for SC
     std::vector<double> switch_priors;
@@ -118,11 +146,20 @@ static int run_online_baseline_dcs_sc(ReadG2O& g2o_manager, int METHOD)
             }
         }
 
+        // Track statistics for this step
+        auto step_start_time = std::chrono::high_resolution_clock::now();
+        double cum_distance = calculate_cumulative_distance(k);
+        stats.time_steps.push_back(k);
+        stats.node_counts.push_back(k + 1);  // node count includes node 0 to k
+        stats.cumulative_distances.push_back(cum_distance);
+        stats.layer_counts.push_back(1);  // baseline methods use single layer
+        
         // log per-node activation summary
         std::cout << "[online] activate node k=" << k
                   << ", odom_added=" << added_odo
                   << ", closure_added=" << added_closure
                   << ", bogus_added=" << added_bogus
+                  << ", cum_dist=" << std::fixed << std::setprecision(3) << cum_distance << "m"
                   << std::endl;
 
         // Only optimize when loop closure or bogus edges are added
@@ -150,8 +187,13 @@ static int run_online_baseline_dcs_sc(ReadG2O& g2o_manager, int METHOD)
             timing_log << k << " loop_edges " << (added_closure + added_bogus) 
                        << " loop_solve " << duration.count() << "\n";
             timing_log.close();
+            
+            // Record processing time for statistics
+            stats.processing_times.push_back(duration.count());
         } else {
             std::cout << "[skip] Only odometry edges added, skipping optimization" << std::endl;
+            // Record 0 processing time when no optimization is performed
+            stats.processing_times.push_back(0.0);
         }
             
     }
@@ -177,6 +219,40 @@ static int run_online_baseline_dcs_sc(ReadG2O& g2o_manager, int METHOD)
     final_timing_log << N-1 << " all " << (g2o_manager.nEdgesClosure.size() + g2o_manager.nEdgesBogus.size()) 
                      << " final_solve " << duration.count() << "\n";
     final_timing_log.close();
+
+    // Output statistics summary
+    std::cout << "\n=== " << method_name << " Statistics ===" << std::endl;
+    if (!stats.time_steps.empty()) {
+        std::cout << "Total steps processed: " << stats.time_steps.size() << std::endl;
+        std::cout << "Final node count: " << stats.node_counts.back() << std::endl;
+        std::cout << "Final cumulative distance: " << std::fixed << std::setprecision(3) 
+                  << stats.cumulative_distances.back() << "m" << std::endl;
+        
+        double total_processing_time = 0.0;
+        for (double t : stats.processing_times) {
+            total_processing_time += t;
+        }
+        std::cout << "Total processing time: " << total_processing_time << "ms" << std::endl;
+    }
+    
+    // Save statistics to file
+    std::string stats_filename = SAVE_PATH + "/" + method_name + "_statistics.txt";
+    std::ofstream stats_file(stats_filename);
+    if (stats_file.is_open()) {
+        stats_file << "# Method Statistics Data\n";
+        stats_file << "# Format: method_name,time_step,node_count,cumulative_distance,layer_count,processing_time_ms\n";
+        
+        for (size_t i = 0; i < stats.time_steps.size(); ++i) {
+            stats_file << stats.method_name << ","
+                      << stats.time_steps[i] << ","
+                      << stats.node_counts[i] << ","
+                      << std::fixed << std::setprecision(6) << stats.cumulative_distances[i] << ","
+                      << stats.layer_counts[i] << ","
+                      << std::fixed << std::setprecision(3) << stats.processing_times[i] << "\n";
+        }
+        stats_file.close();
+        std::cout << "Statistics saved to: " << stats_filename << std::endl;
+    }
 
     // write outputs (poses and edges)
     g2o_manager.writePoseGraph_nodes(SAVE_PATH+"/opt_nodes.txt");

@@ -136,7 +136,7 @@ private:
     // 반환: sum_residual_before - sum_residual_after (양수면 개선)
     double calculate_neighbor_residual_improvement(const std::string& layer_id, Edge* edge);
     // 임시 레이어 기반 엣지 평가/병합 파이프라인
-    void process_edge_with_temp_layer(const std::string& parent_id, Edge* edge);
+    double process_edge_with_temp_layer(const std::string& parent_id, Edge* edge);
     double compute_neighbor_improvement_between_layers(const std::string& parent_id, const std::string& child_id, Edge* edge);
     void merge_child_into_parent_and_delete(const std::string& parent_id, const std::string& child_id, Edge* edge);
     bool should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual = std::numeric_limits<double>::quiet_NaN());
@@ -146,6 +146,22 @@ private:
     void optimize_layer_upto_k(const std::string& layer_id, int k);
     void optimize_local_window(const std::string& layer_id, int window_size = 10);
     double evaluate_layer_cost(const std::string& layer_id);
+    
+    // Statistics tracking for different methods
+    struct MethodStats {
+        std::string method_name;
+        std::vector<int> time_steps;
+        std::vector<int> node_counts;
+        std::vector<double> cumulative_distances;
+        std::vector<int> layer_counts;
+        std::vector<double> processing_times;
+    };
+    
+    void track_method_statistics(const std::string& method_name, int time_step, int node_count, 
+                               double cumulative_distance, int layer_count, double processing_time);
+    void output_method_statistics();
+    void save_statistics_to_file(const std::string& filename);
+    double calculate_cumulative_distance_up_to_node(int node_idx);
     
     // 유틸리티
     void log_line(const std::string& s);
@@ -189,6 +205,10 @@ private:
     int layer_id_counter_ = 0;
     int online_active_k_ = -1; // 현재 온라인 단계의 활성 최대 노드 인덱스 (오프라인: -1)
     bool b_add_loop_edges_ = false; // for testing
+    
+    // Method statistics tracking
+    std::map<std::string, MethodStats> method_statistics_;
+    std::chrono::high_resolution_clock::time_point method_start_time_;
 };
 
 //
@@ -233,6 +253,22 @@ private:
     double evaluate_global_cost_upto_k(int k, Edge* exclude_edge, bool include_candidate);
     double calculate_cost_delta_rel(int k, Edge* added_edge);
     double calculate_reward(int k, Edge* added_edge);
+    
+    // Statistics tracking for different methods
+    struct MethodStats {
+        std::string method_name;
+        std::vector<int> time_steps;
+        std::vector<int> node_counts;
+        std::vector<double> cumulative_distances;
+        std::vector<int> layer_counts;
+        std::vector<double> processing_times;
+    };
+    
+    void track_method_statistics(const std::string& method_name, int time_step, int node_count, 
+                               double cumulative_distance, int layer_count, double processing_time);
+    void output_method_statistics();
+    void save_statistics_to_file(const std::string& filename);
+    double calculate_cumulative_distance_up_to_node(int node_idx);
 
 private:
     ReadG2O& g2o_;
@@ -249,6 +285,10 @@ private:
 
     // map Edge* -> switch variable pointer for SC
     std::unordered_map<Edge*, double*> switch_vars_;
+    
+    // Method statistics tracking
+    std::map<std::string, MethodStats> method_statistics_;
+    std::chrono::high_resolution_clock::time_point method_start_time_;
 };
 
 #endif // SIMPLE_LAYER_MANAGER_H
