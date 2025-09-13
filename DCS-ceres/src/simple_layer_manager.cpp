@@ -78,6 +78,14 @@ SimpleLayerManagerV2::~SimpleLayerManagerV2()
     }
 }
 
+int SimpleLayerManagerV2::count_excluded_up_to(int idx) const
+{
+    // excluded_nodes_는 정렬되어 있으므로 upper_bound로 O(log N) 위치를 찾고 거리 계산
+    if (excluded_nodes_.empty()) return 0;
+    auto it = excluded_nodes_.upper_bound(idx);
+    return static_cast<int>(std::distance(excluded_nodes_.begin(), it));
+}
+
 void SimpleLayerManagerV2::run()
 {
     log_line("[run] Starting METHOD 4 with " + std::to_string(candidate_edges_.size()) + " edges");
@@ -126,7 +134,9 @@ void SimpleLayerManagerV2::run()
         // }
         
         // 임시 레이어 개선 기반 파이프라인 적용 (Top-K는 병합 시 수행)
-        double optimization_time = process_edge_with_temp_layer(selected_layer, edge);
+        auto result = process_edge_with_temp_layer(selected_layer, edge);
+        double optimization_time = result.first;
+        std::string proximity_level = result.second;
         
         // Current maximum node index processed (based on edge nodes)
         int max_node_idx = std::max(edge->a->index, edge->b->index);
@@ -152,6 +162,53 @@ void SimpleLayerManagerV2::run()
             
             log_line("[stats] closure/bogus edge detected, adjusted node count: " + 
                      std::to_string(max_node_idx + 1) + " -> " + std::to_string(adjusted_node_count));
+        }
+
+        // Record and exclude close/very_close nodes from future counts
+        if (proximity_level == "close" || proximity_level == "very_close") {
+            int candidate = max_node_idx; // 더 최신 노드를 제외 대상으로 선택
+            auto ins = excluded_nodes_.insert(candidate);
+            if (ins.second) {
+                log_line("[stats] proximity('" + proximity_level + "') -> exclude node index " + std::to_string(candidate) +
+                         ", total_excluded=" + std::to_string(excluded_nodes_.size()));
+            } else {
+                log_line("[stats] proximity('" + proximity_level + "') detected but node " + std::to_string(candidate) + " already excluded");
+            }
+        }
+
+        // Subtract excluded nodes within current index range and log close-count details
+        {
+            int excluded_upto = count_excluded_up_to(max_node_idx);
+
+            // Build list of excluded nodes <= max_node_idx for logging
+            std::vector<int> excluded_list;
+            if (!excluded_nodes_.empty()) {
+                auto it = excluded_nodes_.begin();
+                auto ub = excluded_nodes_.upper_bound(max_node_idx);
+                for (; it != ub; ++it) excluded_list.push_back(*it);
+            }
+
+            // Log: current total nodes, excluded count and which nodes are excluded
+            int total_nodes_now = max_node_idx + 1;
+            {
+                std::ostringstream oss;
+                oss << "[stats] close-count offline: total_nodes=" << total_nodes_now
+                    << ", excluded_count=" << excluded_list.size() << ", excluded_nodes=[";
+                for (size_t qi = 0; qi < excluded_list.size(); ++qi) {
+                    if (qi) oss << ",";
+                    oss << excluded_list[qi];
+                }
+                oss << "]";
+                log_line(oss.str());
+            }
+
+            int prev = adjusted_node_count;
+            adjusted_node_count = std::max(1, adjusted_node_count - excluded_upto);
+            if (excluded_upto > 0) {
+                log_line("[stats] exclude upto index " + std::to_string(max_node_idx) +
+                         ": -" + std::to_string(excluded_upto) +
+                         " => " + std::to_string(prev) + " -> " + std::to_string(adjusted_node_count));
+            }
         }
         
         // Track statistics for DCS method (METHOD 4 is DCS-based)
@@ -275,7 +332,9 @@ void SimpleLayerManagerV2::run_online()
             }
             
             // 임시 레이어 개선 기반 파이프라인 적용 (Top-K는 병합 시 수행)
-            double optimization_time = process_edge_with_temp_layer(selected_layer, edge);
+            auto result = process_edge_with_temp_layer(selected_layer, edge);
+        double optimization_time = result.first;
+        std::string proximity_level = result.second;
             
             // In online mode, track statistics based on current active node k
             double cum_distance = calculate_cumulative_distance_up_to_node(k);
@@ -290,6 +349,53 @@ void SimpleLayerManagerV2::run_online()
                 
                 log_line("[stats] online closure/bogus edge detected, adjusted node count: " + 
                          std::to_string(k + 1) + " -> " + std::to_string(adjusted_node_count));
+            }
+
+            // Record and exclude close/very_close nodes; in online, 최신 노드 k를 제외 대상으로 사용
+            if (proximity_level == "close" || proximity_level == "very_close") {
+                int candidate = k;
+                auto ins = excluded_nodes_.insert(candidate);
+                if (ins.second) {
+                    log_line("[stats] online proximity('" + proximity_level + "') -> exclude node index " + std::to_string(candidate) +
+                             ", total_excluded=" + std::to_string(excluded_nodes_.size()));
+                } else {
+                    log_line("[stats] online proximity('" + proximity_level + "') detected but node " + std::to_string(candidate) + " already excluded");
+                }
+            }
+
+            // Subtract excluded nodes within current index range and log close-count details
+            {
+                int excluded_upto = count_excluded_up_to(k);
+
+                // Build list of excluded nodes <= k for logging
+                std::vector<int> excluded_list;
+                if (!excluded_nodes_.empty()) {
+                    auto it = excluded_nodes_.begin();
+                    auto ub = excluded_nodes_.upper_bound(k);
+                    for (; it != ub; ++it) excluded_list.push_back(*it);
+                }
+
+                // Log: current total nodes, excluded count and which nodes are excluded (online)
+                int total_nodes_now = k + 1;
+                {
+                    std::ostringstream oss;
+                    oss << "[stats] close-count online: total_nodes=" << total_nodes_now
+                        << ", excluded_count=" << excluded_list.size() << ", excluded_nodes=[";
+                    for (size_t qi = 0; qi < excluded_list.size(); ++qi) {
+                        if (qi) oss << ",";
+                        oss << excluded_list[qi];
+                    }
+                    oss << "]";
+                    log_line(oss.str());
+                }
+
+                int prev = adjusted_node_count;
+                adjusted_node_count = std::max(1, adjusted_node_count - excluded_upto);
+                if (excluded_upto > 0) {
+                    log_line("[stats] online exclude upto index " + std::to_string(k) +
+                             ": -" + std::to_string(excluded_upto) +
+                             " => " + std::to_string(prev) + " -> " + std::to_string(adjusted_node_count));
+                }
             }
             
             // Track statistics for DCS method in online mode
@@ -1128,10 +1234,10 @@ void SimpleLayerManagerV2::merge_child_into_parent_and_delete(const std::string&
     log_line("[merge] merged child " + child_id + " into parent " + parent_id + " and deleted child");
 }
 
-double SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& parent_id, Edge* edge)
+std::pair<double, std::string> SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& parent_id, Edge* edge)
 {
     auto* parent = get_layer(parent_id);
-    if (!parent || !edge) return 0.0;
+    if (!parent || !edge) return std::make_pair(0.0, "far");
 
     // 1) 임시 레이어 생성 (엣지 포함)
     std::string child_id = create_child_layer(parent_id, edge, true);
@@ -1176,10 +1282,10 @@ double SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& par
 
     // 새 엣지의 chi2 값만 확인 (최적화된 자식 레이어에서)
     auto* child = get_layer(child_id);
-    if (!child) return total_optimization_time;
+    if (!child) return std::make_pair(total_optimization_time, "far");
     
     int ia = edge->a->index, ib = edge->b->index;
-    if (ia < 0 || ib < 0 || ia >= (int)child->poses.size() || ib >= (int)child->poses.size()) return total_optimization_time;
+    if (ia < 0 || ib < 0 || ia >= (int)child->poses.size() || ib >= (int)child->poses.size()) return std::make_pair(total_optimization_time, "far");
     
     double new_edge_chi2 = edge_chi2(child->poses[ia], child->poses[ib], edge);
     
@@ -1202,19 +1308,20 @@ double SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& par
     
         
     // Statistical thresholds for node proximity (based on typical SLAM uncertainty)
-    const double close_euclidean_threshold = 1.5;    // 1.5m - typical GPS/odometry accuracy
-    const double close_angular_threshold = 5.0 * M_PI / 180.0; // 5 degrees - typical orientation uncertainty
-    const double very_close_euclidean_threshold = 0.1; // 0.1m - very close nodes
-    const double very_close_angular_threshold = 2.0 * M_PI / 180.0; // 2 degrees - very close orientation
+    const double close_euclidean_threshold = 15;    // 1.5m - typical GPS/odometry accuracy
+    const double close_angular_threshold = 360.0 * M_PI / 180.0; // 5 degrees - typical orientation uncertainty
+    const double very_close_euclidean_threshold = 4; // 0.1m - very close nodes
+    const double very_close_angular_threshold = 180.0 * M_PI / 180.0; // 2 degrees - very close orientation
     
     // Determine proximity level
     std::string proximity_level = "far";
-    if (euclidean_dist <= very_close_euclidean_threshold && angular_dist <= very_close_angular_threshold) {
-        proximity_level = "very_close";
-    } else if (euclidean_dist <= close_euclidean_threshold && angular_dist <= close_angular_threshold) {
+
+    if (euclidean_dist <= close_euclidean_threshold && angular_dist <= close_angular_threshold) {
         proximity_level = "close";
     }
-    
+    if (euclidean_dist <= very_close_euclidean_threshold && angular_dist <= very_close_angular_threshold) {
+        proximity_level = "very_close";
+    } 
 
 
     log_line(std::string("[chi2-filter] new_edge_chi2=") + std::to_string(new_edge_chi2) +
@@ -1275,7 +1382,7 @@ double SimpleLayerManagerV2::process_edge_with_temp_layer(const std::string& par
         backpropagate(child_id, reward);
     }
     
-    return total_optimization_time;
+    return std::make_pair(total_optimization_time, proximity_level);
 }
 
 bool SimpleLayerManagerV2::should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual)

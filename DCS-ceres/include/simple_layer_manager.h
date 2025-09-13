@@ -136,7 +136,7 @@ private:
     // 반환: sum_residual_before - sum_residual_after (양수면 개선)
     double calculate_neighbor_residual_improvement(const std::string& layer_id, Edge* edge);
     // 임시 레이어 기반 엣지 평가/병합 파이프라인
-    double process_edge_with_temp_layer(const std::string& parent_id, Edge* edge);
+    std::pair<double, std::string> process_edge_with_temp_layer(const std::string& parent_id, Edge* edge);
     double compute_neighbor_improvement_between_layers(const std::string& parent_id, const std::string& child_id, Edge* edge);
     void merge_child_into_parent_and_delete(const std::string& parent_id, const std::string& child_id, Edge* edge);
     bool should_add_edge(const std::string& layer_id, Edge* edge, double precomputed_residual = std::numeric_limits<double>::quiet_NaN());
@@ -209,6 +209,12 @@ private:
     // Method statistics tracking
     std::map<std::string, MethodStats> method_statistics_;
     std::chrono::high_resolution_clock::time_point method_start_time_;
+
+    // 가까운(중복 처리 대상) 노드 인덱스 집합
+    // - 중복 삽입 방지: std::set으로 유일성 및 정렬 유지
+    // - 카운트는 집합 크기이거나, 구간별로 upper_bound로 빠르게 계산 가능
+    std::set<int> excluded_nodes_;
+    int count_excluded_up_to(int idx) const;
 };
 
 //
